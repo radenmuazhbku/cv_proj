@@ -1,0 +1,17 @@
+[project]
+name = "cv-proj"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Raden Muhammad Muaz", email = "rara89608@hbku.edu.qa" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+cv-proj = "cv_proj:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
