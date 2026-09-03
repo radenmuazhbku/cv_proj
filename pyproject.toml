@@ -7,7 +7,13 @@ authors = [
     { name = "Raden Muhammad Muaz", email = "rara89608@hbku.edu.qa" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "pillow>=10.0",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+]
 
 [project.scripts]
 cv-proj = "cv_proj:main"
