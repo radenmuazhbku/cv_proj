@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Convert Excel bounding-box annotations and images to COCO detection format.
+"""Convert the DFFF Excel annotations into four COCO dataset splits.
 
-The Excel file must contain: fname, structure, h_min, w_min, h_max, w_max.
-Coordinates are interpreted as (y_min, x_min, y_max, x_max).
+The source directory may contain a nested ``dfff`` directory. Images are
+assigned from their path to Set1, Set2, Internal, or External; they are never
+matched globally by filename alone. The Excel columns must be: fname,
+structure, h_min, w_min, h_max, and w_max. Coordinates are (y_min, x_min,
+y_max, x_max).
 """
 
 from __future__ import annotations
@@ -19,105 +22,156 @@ from PIL import Image
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
 REQUIRED_COLUMNS = {"fname", "structure", "h_min", "w_min", "h_max", "w_max"}
+SOURCE_SPLITS = {
+    "Set1-Training&ValidationSetsCNN": "set1",
+    "Set2-Training&Validation SetsANNScoringsystem": "set2",
+    "Internal_Test_Set": "internal",
+    "External_Test_Set": "external",
+}
 
 
-def image_index(source_dir: Path) -> dict[str, Path]:
-    """Return image paths keyed by filename, rejecting ambiguous filenames."""
-    matches: defaultdict[str, list[Path]] = defaultdict(list)
-    for path in source_dir.rglob("*"):
-        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
-            matches[path.name].append(path)
-
-    ambiguous = {name: paths for name, paths in matches.items() if len(paths) > 1}
-    if ambiguous:
-        details = "; ".join(
-            f"{name}: {', '.join(str(path) for path in paths)}"
-            for name, paths in sorted(ambiguous.items())
-        )
-        raise ValueError(f"Image filenames must be unique under the source directory. {details}")
-    return {name: paths[0] for name, paths in matches.items()}
+def split_and_relative_path(source_dir: Path, image_path: Path) -> tuple[str, Path] | None:
+    """Get the DFFF split and path below its split directory for one image."""
+    parts = image_path.relative_to(source_dir).parts
+    for index, part in enumerate(parts):
+        split = SOURCE_SPLITS.get(part)
+        if split:
+            return split, Path(*parts[index + 1 :])
+    return None
 
 
-def build_coco(source_dir: Path, excel_path: Path) -> tuple[dict, list[tuple[Path, str]]]:
+def index_images(source_dir: Path) -> dict[str, dict[str, tuple[Path, Path]]]:
+    """Index images by split and filename, rejecting duplicates within a split."""
+    images: dict[str, dict[str, tuple[Path, Path]]] = {split: {} for split in SOURCE_SPLITS.values()}
+    for image_path in source_dir.rglob("*"):
+        if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        resolved = split_and_relative_path(source_dir, image_path)
+        if resolved is None:
+            continue
+        split, relative_path = resolved
+        if image_path.name in images[split]:
+            previous, _ = images[split][image_path.name]
+            raise ValueError(
+                f"Duplicate filename in {split}: {image_path.name} ({previous} and {image_path})"
+            )
+        images[split][image_path.name] = (image_path, relative_path)
+    empty_splits = [split for split, files in images.items() if not files]
+    if empty_splits:
+        raise FileNotFoundError(f"No images found for DFFF split(s): {', '.join(empty_splits)}")
+    return images
+
+
+def read_annotations(excel_path: Path) -> pd.DataFrame:
     annotations = pd.read_excel(excel_path)
     missing_columns = REQUIRED_COLUMNS - set(annotations.columns)
     if missing_columns:
         raise ValueError(f"Missing required Excel columns: {', '.join(sorted(missing_columns))}")
-
-    annotations = annotations.loc[:, sorted(REQUIRED_COLUMNS)].copy()
+    annotations = annotations.loc[:, ["fname", "structure", "h_min", "w_min", "h_max", "w_max"]].copy()
     if annotations.isna().any().any():
         raise ValueError("The Excel annotations contain missing values.")
-
     annotations["fname"] = annotations["fname"].astype(str)
     annotations["structure"] = annotations["structure"].astype(str)
     for column in ("h_min", "w_min", "h_max", "w_max"):
         annotations[column] = pd.to_numeric(annotations[column], errors="raise")
+    return annotations
 
-    images_by_name = image_index(source_dir)
-    referenced_names = set(annotations["fname"])
-    missing_images = sorted(referenced_names - set(images_by_name))
-    if missing_images:
-        preview = ", ".join(missing_images[:10])
-        suffix = "..." if len(missing_images) > 10 else ""
-        raise FileNotFoundError(f"No image was found for {len(missing_images)} annotation filename(s): {preview}{suffix}")
 
-    category_names = sorted(annotations["structure"].unique())
-    categories = [
-        {"id": category_id, "name": name, "supercategory": "object"}
-        for category_id, name in enumerate(category_names, start=1)
-    ]
-    category_ids = {category["name"]: category["id"] for category in categories}
+def assign_annotations_to_splits(
+    annotations: pd.DataFrame, images: dict[str, dict[str, tuple[Path, Path]]]
+) -> dict[str, pd.DataFrame]:
+    filename_splits: defaultdict[str, list[str]] = defaultdict(list)
+    for split, split_images in images.items():
+        for filename in split_images:
+            filename_splits[filename].append(split)
 
-    coco_images = []
+    assignments: dict[str, str] = {}
+    for filename in annotations["fname"].unique():
+        candidates = filename_splits.get(filename, [])
+        if not candidates:
+            raise FileNotFoundError(f"No image found for annotated filename: {filename}")
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Annotated filename exists in multiple splits and cannot be assigned safely: {filename} "
+                f"({', '.join(candidates)})"
+            )
+        assignments[filename] = candidates[0]
+
+    annotations["split"] = annotations["fname"].map(assignments)
+    return {split: annotations.loc[annotations["split"] == split].copy() for split in images}
+
+
+def build_split_coco(
+    split: str,
+    split_images: dict[str, tuple[Path, Path]],
+    split_annotations: pd.DataFrame,
+    categories: list[dict],
+    category_ids: dict[str, int],
+) -> tuple[dict, list[tuple[Path, Path]]]:
+    image_records = []
     files_to_copy = []
     image_ids = {}
-    for image_id, filename in enumerate(sorted(referenced_names), start=1):
-        image_path = images_by_name[filename]
-        with Image.open(image_path) as image:
+    for image_id, filename in enumerate(sorted(split_images), start=1):
+        source_path, relative_path = split_images[filename]
+        with Image.open(source_path) as image:
             width, height = image.size
         image_ids[filename] = image_id
-        coco_images.append(
-            {"id": image_id, "file_name": f"images/{filename}", "width": width, "height": height}
+        image_records.append(
+            {"id": image_id, "file_name": (Path("images") / relative_path).as_posix(),
+             "width": width, "height": height}
         )
-        files_to_copy.append((image_path, filename))
+        files_to_copy.append((source_path, relative_path))
 
-    coco_annotations = []
-    for annotation_id, row in enumerate(annotations.itertuples(index=False), start=1):
-        # Excel convention: h is y, w is x. COCO uses [x, y, width, height].
+    annotations = []
+    for annotation_id, row in enumerate(split_annotations.itertuples(index=False), start=1):
         x_min, y_min = float(row.w_min), float(row.h_min)
         x_max, y_max = float(row.w_max), float(row.h_max)
-        width, height = x_max - x_min, y_max - y_min
-        image = coco_images[image_ids[row.fname] - 1]
-        if width <= 0 or height <= 0:
-            raise ValueError(f"Invalid box at Excel row {annotation_id + 1}: {row}")
+        box_width, box_height = x_max - x_min, y_max - y_min
+        image = image_records[image_ids[row.fname] - 1]
+        if box_width <= 0 or box_height <= 0:
+            raise ValueError(f"Invalid box in {split} for {row.fname}: {row}")
         if x_min < 0 or y_min < 0 or x_max > image["width"] or y_max > image["height"]:
-            raise ValueError(
-                f"Box at Excel row {annotation_id + 1} is outside {row.fname} "
-                f"({image['width']}x{image['height']}): {row}"
-            )
-        coco_annotations.append(
-            {
-                "id": annotation_id,
-                "image_id": image_ids[row.fname],
-                "category_id": category_ids[row.structure],
-                "bbox": [x_min, y_min, width, height],
-                "area": width * height,
-                "iscrowd": 0,
-            }
+            raise ValueError(f"Box is outside {row.fname} ({image['width']}x{image['height']}): {row}")
+        annotations.append(
+            {"id": annotation_id, "image_id": image_ids[row.fname],
+             "category_id": category_ids[row.structure],
+             "bbox": [x_min, y_min, box_width, box_height],
+             "area": box_width * box_height, "iscrowd": 0}
         )
 
     return (
-        {"info": {"description": "Converted from ObjectDetection.xlsx"}, "licenses": [],
-         "images": coco_images, "annotations": coco_annotations, "categories": categories},
+        {"info": {"description": f"DFFF {split} split converted from ObjectDetection.xlsx"},
+         "licenses": [], "images": image_records, "annotations": annotations,
+         "categories": categories},
         files_to_copy,
+    )
+
+
+def write_split(target_dir: Path, split: str, coco: dict, files_to_copy: list[tuple[Path, Path]]) -> None:
+    split_dir = target_dir / split
+    (split_dir / "images").mkdir(parents=True)
+    (split_dir / "annotations").mkdir()
+    for source_path, relative_path in files_to_copy:
+        destination = split_dir / "images" / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination)
+    (split_dir / "annotations" / "instances.json").write_text(
+        json.dumps(coco, indent=2) + "\n", encoding="utf-8"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source_dir", type=Path, help="Directory containing the Excel file and images")
-    parser.add_argument("target_dir", type=Path, help="New output directory for the COCO dataset")
+    parser.add_argument("source_dir", type=Path, help="Directory containing ObjectDetection.xlsx and DFFF images")
+    parser.add_argument(
+        "target_dir",
+        nargs="?",
+        type=Path,
+        default=Path("datasets/coco_dfff"),
+        help="Output directory for the four COCO splits (default: datasets/coco_dfff)",
+    )
     parser.add_argument("--excel", type=Path, help="Excel file path, relative to source_dir unless absolute")
+    parser.add_argument("--overwrite", action="store_true", help="Replace an existing target directory")
     args = parser.parse_args()
 
     source_dir = args.source_dir.resolve()
@@ -128,19 +182,31 @@ def main() -> None:
         parser.error(f"Source directory does not exist: {source_dir}")
     if not excel_path.is_file():
         parser.error(f"Excel file does not exist: {excel_path}")
+    if target_dir == source_dir or source_dir in target_dir.parents or target_dir in source_dir.parents:
+        parser.error("Target directory must not be the source directory or one of its ancestors or descendants")
+    if target_dir.exists() and not args.overwrite:
+        parser.error(f"Target directory already exists: {target_dir} (use --overwrite to replace it)")
+
+    images = index_images(source_dir)
+    all_annotations = read_annotations(excel_path)
+    annotations_by_split = assign_annotations_to_splits(all_annotations, images)
+    category_names = sorted(all_annotations["structure"].unique())
+    categories = [
+        {"id": category_id, "name": name, "supercategory": "object"}
+        for category_id, name in enumerate(category_names, start=1)
+    ]
+    category_ids = {category["name"]: category["id"] for category in categories}
+
+    results = {
+        split: build_split_coco(split, images[split], annotations_by_split[split], categories, category_ids)
+        for split in images
+    }
     if target_dir.exists():
-        parser.error(f"Target directory already exists: {target_dir}")
-
-    coco, files_to_copy = build_coco(source_dir, excel_path)
-    (target_dir / "images").mkdir(parents=True)
-    (target_dir / "annotations").mkdir()
-    for source_path, filename in files_to_copy:
-        shutil.copy2(source_path, target_dir / "images" / filename)
-    annotation_path = target_dir / "annotations" / "instances.json"
-    annotation_path.write_text(json.dumps(coco, indent=2) + "\n", encoding="utf-8")
-
-    print(f"Wrote {len(coco['images'])} images, {len(coco['annotations'])} annotations, and "
-          f"{len(coco['categories'])} categories to {target_dir}")
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True)
+    for split, (coco, files_to_copy) in results.items():
+        write_split(target_dir, split, coco, files_to_copy)
+        print(f"{split}: {len(coco['images'])} images, {len(coco['annotations'])} annotations")
 
 
 if __name__ == "__main__":
