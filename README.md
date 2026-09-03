@@ -125,3 +125,9 @@ uv run python scripts/split_coco_for_rfdetr.py \
   datasets/coco_dfff/set1 datasets/coco_dfff/set2 datasets/coco_dfff/internal \
   --counts 600 400 100 --seed 7 --overwrite
 ```
+
+# Run
+
+```
+uv run scripts/train_1.py
+```
