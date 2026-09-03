@@ -102,8 +102,8 @@ requires-dist = [
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pillow", specifier = ">=10.0" },
-    { name = "torch", specifier = ">=2.14.0" },
-    { name = "torchvision", specifier = ">=0.29.0" },
+    { name = "torch", specifier = ">=2.10.0" },
+    { name = "torchvision", specifier = ">=0.25.0" },
 ]
 
 [[package]]

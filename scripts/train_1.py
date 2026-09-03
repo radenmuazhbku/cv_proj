@@ -1,9 +1,9 @@
-from rfdetr import RFDETRMedium
+from rfdetr import RFDETRNano
 
-model = RFDETRMedium()
+model = RFDETRNano()
 
 model.train(
-    dataset_dir="path/to/dataset",
+    dataset_dir="datasets/rfdetr_dfff",
     epochs=100,
     batch_size=4,
     grad_accum_steps=4,
