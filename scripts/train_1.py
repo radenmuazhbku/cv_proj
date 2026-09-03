@@ -8,5 +8,5 @@ model.train(
     batch_size=4,
     grad_accum_steps=4,
     lr=1e-4,
-    output_dir="output",
+    output_dir="logs",
 )
