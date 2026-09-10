@@ -10,10 +10,12 @@ The isolated implementation lives in `src/rfdetr_promptable`; the original `src/
 - Binary objectness score and box refinement loss.
 - `CocoBoxPromptDataset`: loads an image and a positive COCO box prompt.
 - `scripts/train_promptable_rfdetr.py`: training, checkpoint save, and one-image inference smoke test.
-- `scripts/evaluate_promptable_rfdetr.py`: prompted IoU evaluation.
+- `scripts/evaluate_promptable_rfdetr.py`: prompted IoU evaluation and qualitative figures.
 - `scripts/generate_coco_prompt_split.py`: deterministic filtered COCO JSON generation.
 
 This is same-image box prompting: the test image itself supplies the box prompt. It is not yet cross-image visual-exemplar prompting.
+
+The RF-DETR detection task is initialized from scratch with `pretrain_weights=None`. The DINOv2 image backbone may load its own pretrained weights; no RF-DETR detection checkpoint or pretrained RF-DETR detection head is loaded.
 
 ## Configuration
 
@@ -21,13 +23,13 @@ Preset: `configs/promptable_coco_class_split.yaml`
 
 The preset selects:
 
-- 100 training images
+- Up to 10,000 training prompt examples
 - 10 training classes
-- 100 validation images
+- All validation images containing seen classes
 - 10 disjoint held-out classes
 - deterministic seed `7`
-- resolution `384`
-- 100 CPU training steps by default
+- resolution `560` with the Base configuration
+- 10,000 GPU training steps by default
 
 COCO category IDs in the preset:
 
@@ -42,16 +44,16 @@ Run from the repository root.
 
 ```bash
 uv run python scripts/generate_coco_prompt_split.py \
-  --source-annotation datasets/mscoco/annotations_trainval2017/annotations/instances_train2017.json \
+  --train-source-annotation datasets/mscoco/annotations_trainval2017/annotations/instances_train2017.json \
+  --validation-source-annotation datasets/mscoco/annotations_trainval2017/annotations/instances_val2017.json \
   --output-dir datasets/mscoco_prompt_split \
   --train-classes 1 3 8 9 10 11 13 14 15 16 \
   --test-classes 17 18 19 20 21 22 23 24 25 27 \
-  --train-images 100 \
-  --test-images 100 \
+  --train-images 10000 \
   --seed 7
 ```
 
-Expected output reports the number of selected images and annotations in `train.json` and `test.json`.
+Expected output reports training, seen-validation, and unseen-test image/annotation counts. It writes `train.json`, `seen_val.json`, and `unseen_test.json`.
 
 ### 2. Train on the seen classes
 
@@ -59,10 +61,10 @@ Expected output reports the number of selected images and annotations in `train.
 uv run python scripts/train_promptable_rfdetr.py \
   --image-dir datasets/mscoco/train2017 \
   --annotation-file datasets/mscoco_prompt_split/train.json \
-  --steps 100 \
+  --steps 10000 \
   --batch-size 1 \
-  --resolution 384 \
-  --device cpu \
+  --resolution 560 \
+  --device cuda \
   --output logs/promptable_coco_class_split.pt
 ```
 
@@ -73,14 +75,28 @@ For a practical run, use a CUDA device and increase `--steps` substantially, for
 ```bash
 uv run python scripts/evaluate_promptable_rfdetr.py \
   --image-dir datasets/mscoco/val2017 \
-  --annotation-file datasets/mscoco_prompt_split/test.json \
+  --annotation-file datasets/mscoco_prompt_split/unseen_test.json \
   --checkpoint logs/promptable_coco_class_split.pt \
-  --resolution 384 \
+  --resolution 560 \
   --threshold 0.0 \
-  --device cpu
+  --figure-dir logs/promptable_experiment/unseen \
+  --device cuda
 ```
 
-The evaluator supplies each held-out object box as the prompt and reports mean prompt score and mean IoU after box refinement.
+The evaluator supplies each held-out object box as the prompt and reports per-class mean score, mean IoU, and recall@0.5. It also writes original, prediction, and prediction-plus-ground-truth figures.
+
+Run the same evaluation on seen validation classes:
+
+```bash
+uv run python scripts/evaluate_promptable_rfdetr.py \
+  --image-dir datasets/mscoco/val2017 \
+  --annotation-file datasets/mscoco_prompt_split/seen_val.json \
+  --checkpoint logs/promptable_coco_class_split.pt \
+  --resolution 560 \
+  --threshold 0.0 \
+  --figure-dir logs/promptable_experiment/seen \
+  --device cuda
+```
 
 ### 4. Run the existing smoke test
 
@@ -90,7 +106,7 @@ uv run python scripts/train_promptable_rfdetr.py \
   --split train2017 \
   --steps 1 \
   --batch-size 1 \
-  --resolution 384 \
+  --resolution 560 \
   --output logs/promptable_rfdetr_smoke.pt
 ```
 

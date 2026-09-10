@@ -24,6 +24,7 @@ class CocoBoxPromptDataset(Dataset[dict[str, Any]]):
         negative_ratio: float = 1.0,
         negative_iou_threshold: float = 0.1,
         seed: int = 7,
+        max_examples: int | None = None,
     ) -> None:
         if negative_ratio < 0:
             raise ValueError("negative_ratio must be non-negative")
@@ -46,6 +47,12 @@ class CocoBoxPromptDataset(Dataset[dict[str, Any]]):
                     self.records.append((image_id, annotation, True))
                 count = negative_count + (1 if negative_fraction and (image_id + seed) % 1000 < negative_fraction * 1000 else 0)
                 self.records.extend((image_id, annotations, False) for _ in range(count))
+        if max_examples is not None:
+            if max_examples <= 0:
+                raise ValueError("max_examples must be positive")
+            generator = torch.Generator().manual_seed(seed)
+            permutation = torch.randperm(len(self.records), generator=generator).tolist()
+            self.records = [self.records[index] for index in permutation[:max_examples]]
 
     def __len__(self) -> int:
         return len(self.records)
