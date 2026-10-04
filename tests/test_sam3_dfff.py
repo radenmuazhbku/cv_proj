@@ -16,10 +16,24 @@ from cv_proj.sam3_dfff import (
     box_proxy_mask_metrics,
     prepare_manifest,
 )
-from scripts.infer_sam3_dfff import _expand_xyxy_box, _parse_box_expansion, _predict_one
+from scripts.infer_sam3_dfff import (
+    _claim_visualization_slot,
+    _expand_xyxy_box,
+    _parse_box_expansion,
+    _predict_one,
+)
 
 
 class Sam3DfffPreparationTests(unittest.TestCase):
+    def test_visualization_cap_is_per_class(self) -> None:
+        counts: dict[str, int] = {}
+        for _ in range(40):
+            self.assertTrue(_claim_visualization_slot(counts, "nasal bone", 40))
+        self.assertFalse(_claim_visualization_slot(counts, "nasal bone", 40))
+        for _ in range(40):
+            self.assertTrue(_claim_visualization_slot(counts, "NT", 40))
+        self.assertFalse(_claim_visualization_slot(counts, "NT", 40))
+
     def test_prompt_box_expansion_parsing(self) -> None:
         self.assertEqual(_parse_box_expansion("1.5"), ("ratio", 1.5))
         self.assertEqual(_parse_box_expansion("2."), ("ratio", 2.0))
