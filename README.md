@@ -95,6 +95,15 @@ The DFFF conversion generated in this workspace contains 1,684 images, 9,433
 annotations, and 9 categories: Set1 (812/6,742), Set2 (560/2,067), Internal
 (156/624), and External (156/0), shown as images/annotations.
 
+## SAM3 promptable segmentation on DFFF
+
+The SAM3 workflow filters the `nasal bone` and `NT` boxes into separate
+support/query episodes, runs visual-example segmentation with the query labels
+withheld during inference, and saves masks, evaluation metrics, and PNG plots.
+See [the SAM3 DFFF workflow guide](docs/sam3_dfff.md) for split counts, local
+folder/offline bundle modes, setup requirements, commands, and the important
+box-only evaluation limitation.
+
 ## Create an RF-DETR training dataset
 
 RF-DETR detects COCO datasets when every output split contains image files and
