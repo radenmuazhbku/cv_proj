@@ -97,11 +97,26 @@ uv run python scripts/infer_sam3_dfff.py \
 ```
 
 The script accepts `--device cuda` or `--device cpu`, `--checkpoint PATH`,
-`--score-threshold 0.25`, and `--resolution 1008`. CPU execution is supported
-but SAM3 image inference is large and may be slow. For each pair it saves a
-query binary mask and a PNG showing the support box, predicted query mask, and
-(only in this post-inference visualization) the query ground-truth box. It
-also writes `predictions.json`, `metrics.json`, and `metrics.png`.
+`--score-threshold 0.25`, and `--resolution 1008`. Use
+`--prompt-box-expand 1.5` (or `2.`) to scale support-box width and height by
+that ratio, expanding equally around the center. An integer such as
+`--prompt-box-expand 12` adds 12 pixels on every side; `12px` is also accepted
+to make the unit explicit. Expanded coordinates are clipped to the support
+image bounds. The default `1.0` applies no expansion. For example:
+
+```bash
+# Give the positive support prompt 50% more width and height.
+uv run python scripts/infer_sam3_dfff.py --prompt-box-expand 1.5
+
+# Add 12 pixels of margin on each side of every support prompt box.
+uv run python scripts/infer_sam3_dfff.py --prompt-box-expand 12
+```
+
+CPU execution is supported but SAM3 image inference is large and may be slow.
+For each pair the script saves a query binary mask and a PNG showing the
+original support box, expanded prompt box, predicted query mask, and (only in
+this post-inference visualization) the query ground-truth box. It also writes
+`predictions.json`, `metrics.json`, and `metrics.png`.
 
 The support/query pair is packed into a square canvas with aspect-ratio-preserving
 panels; at the default 1008 resolution, one-shot support and query panels are

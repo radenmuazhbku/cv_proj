@@ -16,10 +16,26 @@ from cv_proj.sam3_dfff import (
     box_proxy_mask_metrics,
     prepare_manifest,
 )
-from scripts.infer_sam3_dfff import _predict_one
+from scripts.infer_sam3_dfff import _expand_xyxy_box, _parse_box_expansion, _predict_one
 
 
 class Sam3DfffPreparationTests(unittest.TestCase):
+    def test_prompt_box_expansion_parsing(self) -> None:
+        self.assertEqual(_parse_box_expansion("1.5"), ("ratio", 1.5))
+        self.assertEqual(_parse_box_expansion("2."), ("ratio", 2.0))
+        self.assertEqual(_parse_box_expansion("12"), ("pixels", 12.0))
+        self.assertEqual(_parse_box_expansion("12px"), ("pixels", 12.0))
+
+    def test_prompt_box_expansion_geometry_and_clipping(self) -> None:
+        self.assertEqual(
+            _expand_xyxy_box([10, 20, 30, 60], (100, 100), ("ratio", 1.5)),
+            [5.0, 10.0, 35.0, 70.0],
+        )
+        self.assertEqual(
+            _expand_xyxy_box([2, 3, 20, 24], (25, 25), ("pixels", 10.0)),
+            [0.0, 0.0, 25.0, 25.0],
+        )
+
     def _write_split(
         self,
         root: Path,
@@ -172,12 +188,15 @@ class Sam3DfffPreparationTests(unittest.TestCase):
             support = [{"image_path": str(support_path), "bbox_xyxy": [2, 2, 12, 8]}]
             query = {"query_id": "q", "image_id": 2, "image_path": str(query_path)}
             processor = FakeProcessor()
-            prediction, mask, composite, _ = _predict_one(processor, "NT", support, query, 32)
+            prediction, mask, composite, _ = _predict_one(
+                processor, "NT", support, query, 32, ("pixels", 2.0)
+            )
 
         self.assertEqual(composite.size, (32, 32))
         self.assertEqual(processor.text, "nuchal translucency (NT)")
         self.assertEqual(len(processor.boxes), 1)
         self.assertTrue(processor.boxes[0][1])
+        self.assertEqual(prediction["support_prompt_boxes_xyxy"], [[0.0, 0.0, 14.0, 10.0]])
         self.assertNotIn("bbox_xyxy", query)
         self.assertEqual(mask.shape, (12, 12))
         self.assertTrue(prediction["mask_found"])
