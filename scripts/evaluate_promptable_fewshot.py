@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--support-annotation-file", type=Path, required=True)
     parser.add_argument("--max-shots", type=int, default=5)
     parser.add_argument("--query-batch-size", type=int, default=8)
+    parser.add_argument("--max-query-images", type=int)
     parser.add_argument("--num-queries", type=int, default=100)
     parser.add_argument("--resolution", type=int, default=560)
     parser.add_argument("--seed", type=int, default=7)
@@ -34,6 +35,7 @@ def main() -> None:
     dataset = CocoFewShotEpisodeDataset(
         args.query_image_dir,
         args.query_annotation_file,
+        support_image_dir=support_image_dir,
         resolution=args.resolution,
         max_shots=args.max_shots,
         negative_eval_per_class=0,
@@ -53,12 +55,6 @@ def main() -> None:
     model = PromptableDetector.from_config(config).to(args.device)
     model.load_state_dict(torch.load(args.checkpoint, map_location=args.device))
     model.eval()
-    # The current COCO dataset wrapper uses one image root for both files. Fail
-    # early instead of silently loading support/query image IDs from wrong roots.
-    if support_image_dir != args.query_image_dir:
-        raise ValueError(
-            "support and query images must currently share a directory; pass the same --support-image-dir and --query-image-dir"
-        )
     result = run_coco_map_eval(
         model,
         dataset,
@@ -66,6 +62,7 @@ def main() -> None:
         args.max_shots,
         args.query_batch_size,
         args.seed,
+        max_query_images=args.max_query_images,
     )
     payload = {
         "checkpoint": str(args.checkpoint),
@@ -75,7 +72,15 @@ def main() -> None:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2))
-    print(json.dumps({key: result[key] for key in ("mAP", "mAP50", "mAP75", "mAR100")}, indent=2))
+    print(
+        json.dumps(
+            {
+                key: result[key]
+                for key in ("mAP", "mAP50", "mAP75", "mAR100", "query_image_category_pairs", "elapsed_seconds", "query_pairs_per_second")
+            },
+            indent=2,
+        )
+    )
     print(f"wrote {args.output}")
 
 

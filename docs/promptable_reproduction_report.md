@@ -5,12 +5,12 @@ This report consolidates the current implementation status, data protocol, expec
 ## Current implementation and status
 
 - Cross-image visual few-shot code is isolated in `src/rfdetr_promptable`; the original `src/rfdetr` package is unchanged.
-- Active few-shot presets are Python modules exporting a `cfg` dictionary. The trainer loads them with `--config`; explicit CLI arguments override config values.
+- All active promptable presets are Python modules exporting a `cfg` dictionary or direct argparse options. The split generator and both training runners load Python configs with `--config`; explicit CLI arguments override config values. Historical snapshot and framework-native YAML files are retained, not loaded by promptable workflows.
 - RF-DETR detection/query/box task weights are initialized from scratch. The DINOv2 backbone loads its pretrained weights at the Base model's 560-pixel resolution.
 - Support image features are pooled in the supplied support box. Query images do not receive their ground-truth boxes as model inputs.
-- The episodic diagnostic reports localization and presence measures. The final runner also uses `pycocotools.COCOeval` for bbox AP and AR.
+- The episodic diagnostic reports localization and presence measures. The runner uses `pycocotools.COCOeval` for checkpoint selection and final bbox AP/AR.
 - **The 10,000-step experiments have not been run to completion.** Current metric values from one-step/tiny-subset smoke runs are plumbing checks, not accuracy results.
-- Checkpoint selection uses seen-validation episodic macro IoU. COCO mAP is computed for the selected checkpoint at the end, not used for checkpoint selection.
+- Checkpoint selection uses COCO mAP on a deterministic, class-stratified 500-query seen-validation subset by default. Final mAP is measured over the full query split.
 
 ## Requirements and dataset layout
 
@@ -45,7 +45,7 @@ test -f datasets/mscoco/annotations_trainval2017/annotations/instances_val2017.j
 
 The seen/training classes are COCO IDs `1, 3, 8, 9, 10, 11, 13, 14, 15, 16`. The disjoint held-out classes are `17, 18, 19, 20, 21, 22, 23, 24, 25, 27`.
 
-Generate the filtered annotation files from the Python config (CLI options override `cfg` values):
+Generate the filtered annotation files and disjoint support/query pools from the Python config (CLI options override `cfg` values):
 
 ```bash
 uv run python scripts/generate_coco_prompt_split.py \
@@ -64,13 +64,15 @@ uv run python scripts/generate_coco_prompt_split.py \
   --train-images 10000 --seed 7
 ```
 
-The generator filters annotations by class. The train JSON includes the selected 10,000 train images; each validation/test JSON retains all 5,000 COCO val image records so COCO AP includes images without the evaluated classes. The verified generated counts are:
+The generator filters annotations by class. The train JSON includes the selected 10,000 train images. It reserves up to five support images per class and excludes their union from the common seen-validation and held-out query sets, leaving all other COCO val images—including images with no evaluated-class annotations—for AP evaluation. The verified generated counts are:
 
 | Split | Image records | Annotations |
 | --- | ---: | ---: |
 | `train.json` | 10,000 | 48,168 |
-| `seen_val.json` | 5,000 | 15,507 |
-| `unseen_test.json` | 5,000 | 2,631 |
+| `seen_support.json` | 49 | 303 |
+| `seen_val.json` | 4,951 | 15,204 |
+| `unseen_support.json` | 49 | 160 |
+| `unseen_test.json` | 4,951 | 2,471 |
 
 Verify a regenerated split:
 
@@ -78,7 +80,7 @@ Verify a regenerated split:
 uv run python - <<'PY'
 import json
 from pathlib import Path
-for name in ("train.json", "seen_val.json", "unseen_test.json"):
+for name in ("train.json", "seen_support.json", "seen_val.json", "unseen_support.json", "unseen_test.json"):
     data = json.loads((Path("datasets/mscoco_prompt_split") / name).read_text())
     print(name, "images=", len(data["images"]), "annotations=", len(data["annotations"]))
 PY
@@ -121,7 +123,7 @@ uv run python scripts/train_promptable_fewshot.py \
   --coco-eval-batch-size 2
 ```
 
-The defaults configure 10,000 training steps, evaluation every 1,000 steps, 100 decoder queries, resolution 560, and a batch size of 2. `negative_ratio` is the expected negative-to-positive training episode ratio: `0.5` means one negative per two positives on average; `1.5` emphasizes absent-class rejection.
+The defaults configure 10,000 training steps, evaluation every 1,000 steps, COCO mAP checkpoint selection on 500 stratified query images, 100 decoder queries, resolution 560, and a batch size of 2. `negative_ratio` is the expected negative-to-positive training episode ratio: `0.5` means one negative per two positives on average; `1.5` emphasizes absent-class rejection.
 
 Outputs follow the config's `output` and `figure_dir`, for example:
 
@@ -134,9 +136,24 @@ logs/promptable_fewshot_figures/1shot/heldout_test/
 
 The `.metrics.json` records episodic scores and two standard COCO evaluation sections: `seen_validation_coco` and `held_out_coco`. COCO AP values are on the 0–1 scale. COCO AP is the 101-point interpolated average over IoU thresholds 0.50:0.05:0.95; AP50/AP75, scale-specific AP, and AR@1/10/100 are also included. The macro mAP is averaged over the configured class set. A deterministic support set is selected per category; the union of all support-image IDs is excluded from a shared query-image set. All other COCO val images, including absent-class images, are queried. The episodic diagnostic remains separate and is not AP.
 
-The best checkpoint is selected by seen-validation episodic macro IoU, not by COCO mAP. Final COCO evaluation can be lengthy: the current implementation recomputes image features during batched evaluation. `--coco-eval-batch-size` controls the query batch size and memory use.
+The best checkpoint is selected by seen-validation COCO mAP by default; `--selection-metric episodic_iou` restores the alternate episodic-IoU criterion. Final COCO evaluation can be lengthy; support ROI embeddings are cached once per category to avoid recomputing exemplar backbones for every query batch. `--coco-eval-batch-size` controls query batch size and memory use.
 
-There is currently no standalone support/query COCO-evaluation command for an already-trained checkpoint; the final COCO evaluation is part of the training runner. To recompute these metrics with the current code, rerun the selected experiment/config.
+The support/query COCO evaluator can also be run independently on an existing checkpoint:
+
+```bash
+uv run python scripts/evaluate_promptable_fewshot.py \
+  --checkpoint logs/promptable_fewshot_5shot.best.pt \
+  --query-image-dir datasets/mscoco/val2017 \
+  --query-annotation-file datasets/mscoco_prompt_split/unseen_test.json \
+  --support-image-dir datasets/mscoco/val2017 \
+  --support-annotation-file datasets/mscoco_prompt_split/unseen_support.json \
+  --max-shots 5 --query-batch-size 8 --num-queries 100 --resolution 560 \
+  --device cuda --output logs/promptable_fewshot_5shot.heldout_coco.json
+```
+
+Use `--max-query-images 100` for a bounded throughput check; omit it for the complete query split. The evaluator prints elapsed seconds and query/image-category pairs per second and stores those values in its JSON output.
+
+On the local RTX 4090, a smoke checkpoint with 10 decoder queries evaluated 1,000 image/category pairs in 14.26 seconds (about 70 pairs/second), including loading and resizing. This is a bounded smoke benchmark, not a full-resolution 100-query throughput guarantee or an accuracy result.
 
 All active promptable presets are Python `cfg` modules or direct argparse options. The frozen `experiments/promptable_v1/` snapshot retains its historical YAML preset for archival reproducibility; RF-DETR and SAM3 upstream YAML configs are left intact because their existing loaders depend on them.
 
@@ -175,6 +192,21 @@ def make_subset(source_name: str, category_id: int, positive_count: int, empty_c
 make_subset("train.json", 1, positive_count=5, empty_count=2)
 make_subset("seen_val.json", 1, positive_count=3, empty_count=1)
 make_subset("unseen_test.json", 17, positive_count=3, empty_count=1)
+
+def make_support_subset(source_name: str, output_name: str, category_id: int) -> None:
+  source = json.loads((source_dir / source_name).read_text())
+  annotations = [a for a in source["annotations"] if a["category_id"] == category_id]
+  image_id = annotations[0]["image_id"]
+  result = {
+    **source,
+    "images": [im for im in source["images"] if im["id"] == image_id],
+    "annotations": [a for a in annotations if a["image_id"] == image_id],
+    "categories": [c for c in source["categories"] if c["id"] == category_id],
+  }
+  (out_dir / output_name).write_text(json.dumps(result))
+
+make_support_subset("seen_support.json", "seen_support.json", 1)
+make_support_subset("unseen_support.json", "unseen_support.json", 17)
 print("wrote smoke annotations to", out_dir)
 PY
 ```
@@ -188,8 +220,10 @@ uv run python scripts/train_promptable_fewshot.py \
   --train-annotation-file /tmp/promptable_smoke/train.json \
   --validation-image-dir datasets/mscoco/val2017 \
   --validation-annotation-file /tmp/promptable_smoke/seen_val.json \
+  --validation-support-annotation-file /tmp/promptable_smoke/seen_support.json \
   --test-image-dir datasets/mscoco/val2017 \
   --test-annotation-file /tmp/promptable_smoke/unseen_test.json \
+  --test-support-annotation-file /tmp/promptable_smoke/unseen_support.json \
   --episodes 8 --max-shots 1 --negative-eval-per-class 1 \
   --steps 1 --eval-every 1 --batch-size 2 --coco-eval-batch-size 2 \
   --num-queries 10 --resolution 560 --device cuda \
@@ -209,6 +243,12 @@ for key in ("seen_validation_coco", "held_out_coco"):
     result = metrics[key]
     print(key, "mAP=", result["mAP"], "mAP50=", result["mAP50"], "mAP75=", result["mAP75"])
 PY
+```
+
+Run the persistent regression tests:
+
+```bash
+uv run python -m unittest discover -s tests -v
 ```
 
 ## Run cross-image inference
@@ -231,6 +271,7 @@ Predicted boxes in the output JSON are pixel `xyxy` coordinates in each query im
 ```bash
 uv run python scripts/train_promptable_fewshot.py --help
 uv run python scripts/infer_promptable.py --help
+uv run python scripts/evaluate_promptable_fewshot.py --help
 uv run python scripts/generate_coco_prompt_split.py --help
 ```
 

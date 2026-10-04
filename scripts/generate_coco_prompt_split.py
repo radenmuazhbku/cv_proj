@@ -16,18 +16,18 @@ def filter_coco(
     category_ids: set[int],
     image_count: int | None,
     seed: int,
-    include_all_images: bool = False,
 ) -> dict[str, Any]:
+    if image_count is not None and image_count <= 0:
+        raise ValueError("image_count must be positive when specified")
     annotations = [ann for ann in source["annotations"] if ann["category_id"] in category_ids]
     image_ids_with_targets = sorted({ann["image_id"] for ann in annotations})
     rng = random.Random(seed)
     rng.shuffle(image_ids_with_targets)
-    selected_image_ids = set(image_ids_with_targets[:image_count] if image_count else image_ids_with_targets)
+    selected_image_ids = set(
+        image_ids_with_targets if image_count is None else image_ids_with_targets[:image_count]
+    )
     annotations = [ann for ann in annotations if ann["image_id"] in selected_image_ids]
-    images = [
-        image for image in source["images"]
-        if include_all_images or image["id"] in selected_image_ids
-    ]
+    images = [image for image in source["images"] if image["id"] in selected_image_ids]
     categories = [category for category in source["categories"] if category["id"] in category_ids]
     return {"info": source.get("info", {}), "licenses": source.get("licenses", []), "images": images, "annotations": annotations, "categories": categories}
 

@@ -20,6 +20,8 @@ cfg = {
     "negative_eval_per_class": 100,
     "steps": 10_000,
     "eval_every": 1_000,
+    "selection_metric": "coco_map",
+    "coco_selection_images": 500,
     "batch_size": 2,
     "coco_eval_batch_size": 8,
     "num_queries": 100,

@@ -90,29 +90,15 @@ class PromptableDetector(nn.Module):
         pred_boxes = (self.detector.bbox_embed(hs_last) + ref_last).sigmoid()
         return {"pred_logits": self.objectness(hs_last), "pred_boxes": pred_boxes}
 
-    def forward_support_query(
+    def encode_support(
         self,
         support_images: Tensor,
         support_boxes: Tensor,
-        query_images: Tensor,
         support_group_ids: Tensor | None = None,
-        query_to_support: Tensor | None = None,
-    ) -> dict[str, Tensor]:
-        """Detect support examples in separate query images.
-
-        Args:
-            support_images: ``[S,3,H,W]`` images containing the exemplars.
-            support_boxes: ``[S,4]`` or ``[S,K,4]`` normalized ``cxcywh`` boxes.
-                Rows are support examples; K provides multiple boxes per support image.
-            query_images: ``[B,3,H,W]`` target images to search.
-            support_group_ids: Optional ``[S]`` IDs grouping support image/box
-                examples into concepts. Repeated IDs represent multiple shots of the
-                same concept. Defaults to one concept per support image.
-            query_to_support: Optional ``[B]`` IDs mapping each query image to one
-                support concept. When absent, all support examples are pooled together.
-        """
-        if support_images.ndim != 4 or query_images.ndim != 4:
-            raise ValueError("support_images and query_images must have shape [N,3,H,W].")
+    ) -> tuple[Tensor, Tensor]:
+        """Encode and group support image/box examples for reuse across queries."""
+        if support_images.ndim != 4:
+            raise ValueError("support_images must have shape [S,3,H,W].")
         if support_boxes.ndim == 2:
             support_boxes = support_boxes[:, None, :]
         if support_boxes.ndim != 3 or support_boxes.shape[-1] != 4:
@@ -125,11 +111,13 @@ class PromptableDetector(nn.Module):
         support_map = support_features[-1].tensors
         _, _, feature_height, feature_width = support_map.shape
         support_count, boxes_per_image, _ = support_boxes.shape
-        support_boxes_flat = support_boxes.reshape(-1, 4)
-        support_indices = torch.arange(support_count, device=support_images.device).repeat_interleave(boxes_per_image)
+        support_boxes_flat = support_boxes.reshape(-1, 4).to(
+            device=support_map.device, dtype=support_map.dtype
+        )
+        support_indices = torch.arange(support_count, device=support_map.device).repeat_interleave(
+            boxes_per_image
+        )
         input_height, input_width = support_images.shape[-2:]
-        support_boxes_flat = support_boxes_flat.to(device=support_map.device, dtype=support_map.dtype)
-        support_indices = support_indices.to(device=support_map.device)
         rois = torch.cat(
             [
                 support_indices[:, None].to(support_boxes_flat.dtype),
@@ -153,12 +141,11 @@ class PromptableDetector(nn.Module):
             spatial_scale=(feature_width / input_width + feature_height / input_height) / 2,
             aligned=True,
         ).mean(dim=(-1, -2))
-        support_geom = support_boxes_flat
-        example_tokens = self.support_roi_encoder(roi_features) + self.prompt_encoder(support_geom)
-
-        query_count = query_images.shape[0]
+        example_tokens = self.support_roi_encoder(roi_features) + self.prompt_encoder(support_boxes_flat)
         if support_group_ids is None:
-            support_group_ids = torch.arange(support_count, device=support_images.device)
+            support_group_ids = torch.arange(support_count, device=support_map.device)
+        else:
+            support_group_ids = support_group_ids.to(device=support_map.device, dtype=torch.long)
         if support_group_ids.shape != (support_count,):
             raise ValueError("support_group_ids must have shape [number of support images].")
         shot_tokens = example_tokens.reshape(support_count, boxes_per_image, -1).mean(dim=1)
@@ -166,6 +153,41 @@ class PromptableDetector(nn.Module):
         grouped_tokens = torch.stack(
             [shot_tokens[support_group_ids == group_id].mean(dim=0) for group_id in group_ids]
         )
+        return grouped_tokens, group_ids
+
+    def forward_support_query(
+        self,
+        support_images: Tensor,
+        support_boxes: Tensor,
+        query_images: Tensor,
+        support_group_ids: Tensor | None = None,
+        query_to_support: Tensor | None = None,
+        encoded_support: tuple[Tensor, Tensor] | None = None,
+    ) -> dict[str, Tensor]:
+        """Detect support examples in separate query images.
+
+        Args:
+            support_images: ``[S,3,H,W]`` images containing the exemplars.
+            support_boxes: ``[S,4]`` or ``[S,K,4]`` normalized ``cxcywh`` boxes.
+                Rows are support examples; K provides multiple boxes per support image.
+            query_images: ``[B,3,H,W]`` target images to search.
+            support_group_ids: Optional ``[S]`` IDs grouping support image/box
+                examples into concepts. Repeated IDs represent multiple shots of the
+                same concept. Defaults to one concept per support image.
+            query_to_support: Optional ``[B]`` IDs mapping each query image to one
+                support concept. When absent, all support examples are pooled together.
+            encoded_support: Optional output of :meth:`encode_support`, allowing the
+                support backbone/ROI features to be reused across query batches.
+        """
+        if query_images.ndim != 4:
+            raise ValueError("query_images must have shape [B,3,H,W].")
+        query_count = query_images.shape[0]
+        if encoded_support is None:
+            grouped_tokens, group_ids = self.encode_support(
+                support_images, support_boxes, support_group_ids
+            )
+        else:
+            grouped_tokens, group_ids = encoded_support
         if query_to_support is None:
             concept_tokens = grouped_tokens.mean(dim=0, keepdim=True).expand(query_count, -1)
         else:

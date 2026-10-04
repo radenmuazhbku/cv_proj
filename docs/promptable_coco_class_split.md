@@ -29,7 +29,7 @@ The preset selects:
 
 - Up to 10,000 training prompt examples
 - 10 training classes
-- All validation images containing seen classes
+- A deterministic five-image-per-class support pool; all other validation images remain available as queries
 - 10 disjoint held-out classes
 - deterministic seed `7`
 - resolution `560` with the Base configuration
@@ -53,7 +53,7 @@ uv run python scripts/generate_coco_prompt_split.py \
 
 Pass any generator options directly to override the preset; for example, add `--seed 11 --train-images 5000`.
 
-Expected output reports training, seen-validation, and unseen-test image/annotation counts. It writes `train.json`, `seen_val.json`, and `unseen_test.json`.
+Expected output reports train, seen/unseen support, and seen/unseen query image/annotation counts. It writes `train.json`, `seen_support.json`, `seen_val.json`, `unseen_support.json`, and `unseen_test.json`.
 
 ### 2. Train on the seen classes
 
@@ -73,7 +73,7 @@ For a practical run, use a CUDA device and increase `--steps` substantially, for
 uv run python scripts/evaluate_promptable_rfdetr.py \
   --image-dir datasets/mscoco/val2017 \
   --annotation-file datasets/mscoco_prompt_split/unseen_test.json \
-  --checkpoint logs/promptable_coco_class_split.pt \
+  --checkpoint logs/promptable_same_image_baseline.best.pt \
   --resolution 560 \
   --threshold 0.0 \
   --figure-dir logs/promptable_experiment/unseen \

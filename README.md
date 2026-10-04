@@ -1,5 +1,9 @@
 # CV project
 
+## Promptable COCO experiments
+
+See [the promptable reproduction report](docs/promptable_reproduction_report.md) for environment setup, dataset generation, training/evaluation commands, and the current experiment status.
+
 Tools for converting the DFFF object-detection annotations to the Microsoft COCO
 dataset format.
 
@@ -17,32 +21,32 @@ uv sync
 
 ## Convert Excel annotations to COCO
 
-[`scripts/convert_excel_to_coco.py`](scripts/convert_excel_to_coco.py) accepts
+[`scripts/preprocess_dfff_to_coco.py`](scripts/preprocess_dfff_to_coco.py) accepts
 a source directory and a target directory. It reads `ObjectDetection.xlsx` by
 default, identifies each image's DFFF parent folder, and produces four separate
 COCO splits: `set1`, `set2`, `internal`, and `external`.
 
 ```bash
-uv run python scripts/convert_excel_to_coco.py <source-folder> <target-folder>
+uv run python scripts/preprocess_dfff_to_coco.py <source-folder> <target-folder>
 ```
 
 For the DFFF data linked into this repository, the default output location is
 `datasets/coco_dfff`:
 
 ```bash
-uv run python scripts/convert_excel_to_coco.py datasets/dfff --overwrite
+uv run python scripts/preprocess_dfff_to_coco.py datasets/dfff --overwrite
 ```
 
 Pass a second positional argument to use another output location:
 
 ```bash
-uv run python scripts/convert_excel_to_coco.py datasets/dfff path/to/coco_dfff --overwrite
+uv run python scripts/preprocess_dfff_to_coco.py datasets/dfff path/to/coco_dfff --overwrite
 ```
 
 Use `--excel` when the annotation workbook has another name or location:
 
 ```bash
-uv run python scripts/convert_excel_to_coco.py <source-folder> <target-folder> \
+uv run python scripts/preprocess_dfff_to_coco.py <source-folder> <target-folder> \
   --excel path/to/annotations.xlsx
 ```
 

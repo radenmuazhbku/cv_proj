@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -132,6 +133,7 @@ def run_coco_map_eval(
     max_shots: int,
     query_batch_size: int,
     seed: int,
+    max_query_images: int | None = None,
 ) -> dict[str, object]:
     """Evaluate class-conditioned detections with standard COCO AP/AR metrics.
 
@@ -142,6 +144,8 @@ def run_coco_map_eval(
     """
     if query_batch_size <= 0:
         raise ValueError("query_batch_size must be positive")
+    if max_query_images is not None and max_query_images <= 0:
+        raise ValueError("max_query_images must be positive when specified")
     coco_gt = dataset.coco
     all_image_ids = sorted(coco_gt.getImgIds())
     categories = sorted(coco_gt.getCatIds())
@@ -157,9 +161,11 @@ def run_coco_map_eval(
             else dataset.category_images
         )
         positive_image_ids = sorted(support_image_index.get(category_id, []))
-        if len(positive_image_ids) < 2:
+        minimum_support = 1 if dataset.has_separate_support else 2
+        if len(positive_image_ids) < minimum_support:
             continue
-        support_count = min(max_shots, len(positive_image_ids) - 1)
+        available_shots = len(positive_image_ids) if dataset.has_separate_support else len(positive_image_ids) - 1
+        support_count = min(max_shots, available_shots)
         support_ids_by_category[category_id] = sorted(
             positive_image_ids,
             key=lambda image_id: (seed * 1_000_003 + image_id) % 2**32,
@@ -174,6 +180,24 @@ def run_coco_map_eval(
         if dataset.has_separate_support
         else [image_id for image_id in all_image_ids if image_id not in excluded_support_ids]
     )
+    if max_query_images is not None and len(query_ids) > max_query_images:
+        query_set = set(query_ids)
+        selected: set[int] = set()
+        per_category_quota = max(1, max_query_images // (2 * max(1, len(categories))))
+        for category_id in categories:
+            candidates = [
+                image_id for image_id in dataset.category_images.get(category_id, [])
+                if image_id in query_set
+            ]
+            selected.update(candidates[:per_category_quota])
+        ordered_ids = [image_id for image_id in query_ids if image_id in selected]
+        if len(ordered_ids) < max_query_images:
+            ordered_ids.extend(
+                image_id for image_id in query_ids
+                if image_id not in selected
+            )
+        query_ids = ordered_ids[:max_query_images]
+    evaluation_started = time.perf_counter()
     model_was_training = model.training
     model.eval()
 
@@ -206,6 +230,11 @@ def run_coco_map_eval(
 
             category_results: list[dict[str, float | int]] = []
             group_ids = torch.full((support_count,), category_id, dtype=torch.long, device=device)
+            support_images_tensor = torch.stack(support_images).to(device)
+            support_boxes_tensor = torch.stack(support_boxes).to(device)
+            encoded_support = model.encode_support(
+                support_images_tensor, support_boxes_tensor, support_group_ids=group_ids
+            )
             for start in range(0, len(query_ids), query_batch_size):
                 batch_ids = query_ids[start : start + query_batch_size]
                 query_tensors: list[torch.Tensor] = []
@@ -216,13 +245,14 @@ def run_coco_map_eval(
                     query_sizes.append((width, height))
                 query_count = len(batch_ids)
                 outputs = model.forward_support_query(
-                    torch.stack(support_images).to(device),
-                    torch.stack(support_boxes).to(device),
+                    support_images_tensor,
+                    support_boxes_tensor,
                     torch.stack(query_tensors).to(device),
                     support_group_ids=group_ids,
                     query_to_support=torch.full(
                         (query_count,), category_id, dtype=torch.long, device=device
                     ),
+                    encoded_support=encoded_support,
                 )
                 scores = outputs["pred_logits"].sigmoid()[..., 0]
                 boxes = box_cxcywh_to_xyxy(outputs["pred_boxes"])
@@ -295,6 +325,7 @@ def run_coco_map_eval(
 
     if model_was_training:
         model.train()
+    elapsed_seconds = time.perf_counter() - evaluation_started
     def macro(metric_name: str) -> float:
         values = [
             float(value[metric_name])
@@ -315,6 +346,13 @@ def run_coco_map_eval(
         "mAR10": macro("AR10"),
         "mAR100": macro("AR100"),
         "metric_scale": "0_to_1",
+        "query_image_category_pairs": len(query_ids) * len(category_metrics),
+        "elapsed_seconds": elapsed_seconds,
+        "query_pairs_per_second": (
+            len(query_ids) * len(category_metrics) / elapsed_seconds
+            if elapsed_seconds > 0
+            else 0.0
+        ),
         "evaluation_protocol": (
             "COCOeval bbox; dedicated support images are disjoint from all query images"
             if dataset.has_separate_support
@@ -388,6 +426,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--figure-dir", type=Path, default=Path("logs/promptable_fewshot_figures"))
     parser.add_argument("--max-figures-per-class", type=int, default=10)
+    parser.add_argument("--selection-metric", choices=("coco_map", "episodic_iou"), default="coco_map")
+    parser.add_argument("--coco-selection-images", type=int, default=500)
     parser.add_argument("--output", type=Path, default=Path("logs/promptable_fewshot.pt"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parse_args_with_python_config(parser)
@@ -442,7 +482,7 @@ def main() -> None:
     model = build_model(args.resolution, args.num_queries, args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     iterator = iter(train_loader)
-    best_iou = float("-inf")
+    best_score = float("-inf")
     metrics: dict[str, object] = {"seed": args.seed, "train_config": vars(args) | {"device": args.device}}
     model.train()
     for step in tqdm(range(args.steps), desc="train"):
@@ -466,11 +506,30 @@ def main() -> None:
         optimizer.step()
         if (step + 1) % args.eval_every == 0:
             val_result = run_episode_eval(model, val_loader, device)
-            metrics[f"validation_step_{step + 1}"] = val_result
-            macro_iou = float(val_result["macro_positive_iou"])
-            print(f"validation step={step + 1} macro_iou={macro_iou:.4f}")
-            if macro_iou > best_iou:
-                best_iou = macro_iou
+            selection_result = run_coco_map_eval(
+                model,
+                val_dataset,
+                device,
+                args.max_shots,
+                args.coco_eval_batch_size,
+                args.seed,
+                max_query_images=args.coco_selection_images,
+            )
+            metrics[f"validation_step_{step + 1}"] = {
+                "episodic": val_result,
+                "coco_selection": selection_result,
+            }
+            score = (
+                float(selection_result["mAP"])
+                if args.selection_metric == "coco_map"
+                else float(val_result["macro_positive_iou"])
+            )
+            print(
+                f"validation step={step + 1} selection_metric={args.selection_metric} "
+                f"score={score:.4f}"
+            )
+            if score > best_score:
+                best_score = score
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), args.output.with_name(f"{args.output.stem}.best{args.output.suffix}"))
         model.train()
