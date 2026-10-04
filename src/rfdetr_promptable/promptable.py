@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor, nn
+from torchvision.ops import roi_align
 from torchvision.transforms import functional as TF
 
 from rfdetr_promptable.config import ModelConfig, TrainConfig
@@ -32,6 +33,18 @@ class PromptableDetector(nn.Module):
         hidden_dim = detector.transformer.d_model
         self.prompt_encoder = nn.Sequential(
             nn.Linear(4, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.support_roi_encoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.support_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -77,16 +90,208 @@ class PromptableDetector(nn.Module):
         pred_boxes = (self.detector.bbox_embed(hs_last) + ref_last).sigmoid()
         return {"pred_logits": self.objectness(hs_last), "pred_boxes": pred_boxes}
 
+    def forward_support_query(
+        self,
+        support_images: Tensor,
+        support_boxes: Tensor,
+        query_images: Tensor,
+        support_group_ids: Tensor | None = None,
+        query_to_support: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Detect support examples in separate query images.
+
+        Args:
+            support_images: ``[S,3,H,W]`` images containing the exemplars.
+            support_boxes: ``[S,4]`` or ``[S,K,4]`` normalized ``cxcywh`` boxes.
+                Rows are support examples; K provides multiple boxes per support image.
+            query_images: ``[B,3,H,W]`` target images to search.
+            support_group_ids: Optional ``[S]`` IDs grouping support image/box
+                examples into concepts. Repeated IDs represent multiple shots of the
+                same concept. Defaults to one concept per support image.
+            query_to_support: Optional ``[B]`` IDs mapping each query image to one
+                support concept. When absent, all support examples are pooled together.
+        """
+        if support_images.ndim != 4 or query_images.ndim != 4:
+            raise ValueError("support_images and query_images must have shape [N,3,H,W].")
+        if support_boxes.ndim == 2:
+            support_boxes = support_boxes[:, None, :]
+        if support_boxes.ndim != 3 or support_boxes.shape[-1] != 4:
+            raise ValueError("support_boxes must have shape [S,4] or [S,K,4] in normalized cxcywh format.")
+        if support_boxes.shape[0] != support_images.shape[0]:
+            raise ValueError("Each support image must have corresponding support boxes.")
+
+        support_nested = nested_tensor_from_tensor_list(support_images)
+        support_features, _, _ = self.detector.backbone(support_nested)
+        support_map = support_features[-1].tensors
+        _, _, feature_height, feature_width = support_map.shape
+        support_count, boxes_per_image, _ = support_boxes.shape
+        support_boxes_flat = support_boxes.reshape(-1, 4)
+        support_indices = torch.arange(support_count, device=support_images.device).repeat_interleave(boxes_per_image)
+        input_height, input_width = support_images.shape[-2:]
+        support_boxes_flat = support_boxes_flat.to(device=support_map.device, dtype=support_map.dtype)
+        support_indices = support_indices.to(device=support_map.device)
+        rois = torch.cat(
+            [
+                support_indices[:, None].to(support_boxes_flat.dtype),
+                torch.stack(
+                    [
+                        support_boxes_flat[:, 0] - support_boxes_flat[:, 2] / 2,
+                        support_boxes_flat[:, 1] - support_boxes_flat[:, 3] / 2,
+                        support_boxes_flat[:, 0] + support_boxes_flat[:, 2] / 2,
+                        support_boxes_flat[:, 1] + support_boxes_flat[:, 3] / 2,
+                    ],
+                    dim=-1,
+                )
+                * support_boxes_flat.new_tensor([input_width, input_height, input_width, input_height]),
+            ],
+            dim=-1,
+        )
+        roi_features = roi_align(
+            support_map,
+            rois,
+            output_size=(3, 3),
+            spatial_scale=(feature_width / input_width + feature_height / input_height) / 2,
+            aligned=True,
+        ).mean(dim=(-1, -2))
+        support_geom = support_boxes_flat
+        example_tokens = self.support_roi_encoder(roi_features) + self.prompt_encoder(support_geom)
+
+        query_count = query_images.shape[0]
+        if support_group_ids is None:
+            support_group_ids = torch.arange(support_count, device=support_images.device)
+        if support_group_ids.shape != (support_count,):
+            raise ValueError("support_group_ids must have shape [number of support images].")
+        shot_tokens = example_tokens.reshape(support_count, boxes_per_image, -1).mean(dim=1)
+        group_ids = torch.unique(support_group_ids, sorted=True)
+        grouped_tokens = torch.stack(
+            [shot_tokens[support_group_ids == group_id].mean(dim=0) for group_id in group_ids]
+        )
+        if query_to_support is None:
+            concept_tokens = grouped_tokens.mean(dim=0, keepdim=True).expand(query_count, -1)
+        else:
+            if query_to_support.shape != (query_count,):
+                raise ValueError("query_to_support must have shape [number of query images].")
+            group_to_index = {int(group_id): index for index, group_id in enumerate(group_ids.tolist())}
+            try:
+                selected = [group_to_index[int(group_id)] for group_id in query_to_support.tolist()]
+            except KeyError as exc:
+                raise ValueError(f"query_to_support refers to unknown support group {exc.args[0]}.") from exc
+            concept_tokens = grouped_tokens[torch.tensor(selected, device=grouped_tokens.device)]
+
+        query_nested = nested_tensor_from_tensor_list(query_images)
+        query_features, query_positions, query_cross = self.detector.backbone(query_nested)
+        query_srcs, query_masks = [], []
+        for feature in query_features:
+            src, mask = feature.decompose()
+            query_srcs.append(src)
+            query_masks.append(mask)
+        query_cross_srcs = None if query_cross is None else [feature.decompose()[0] for feature in query_cross]
+
+        prompt_count = self.detector.num_queries
+        base_query = self.detector.query_feat.weight[:prompt_count].expand(query_count, prompt_count, -1)
+        concept_tokens = concept_tokens[:, None, :].expand(-1, prompt_count, -1)
+        # Use independent learned DETR references. Neither support box nor query GT
+        # coordinates are reused as query-image locations.
+        query_reference = self.detector.refpoint_embed.weight[:prompt_count].unsqueeze(0).expand(
+            query_count, -1, -1
+        )
+        query_geometry = self.prompt_encoder(query_reference)
+        dynamic_query = base_query + self.support_fusion(torch.cat([concept_tokens, query_geometry], dim=-1))
+        transformer_outputs = self.detector.transformer(
+            query_srcs,
+            query_masks,
+            query_positions,
+            _inverse_sigmoid(query_reference),
+            dynamic_query,
+            cross_attn_srcs=query_cross_srcs,
+        )
+        hs, references = transformer_outputs[:2]
+        if hs is None or references is None:
+            raise RuntimeError("Support/query detection requires decoder layers.")
+        hs_last, ref_last = hs[-1], references[-1]
+        pred_boxes = (self.detector.bbox_embed(hs_last) + ref_last).sigmoid()
+        return {"pred_logits": self.objectness(hs_last), "pred_boxes": pred_boxes}
+
+    @torch.inference_mode()
+    def predict_support_query(
+        self,
+        support_images: Tensor,
+        support_boxes: Tensor,
+        query_images: Tensor,
+        support_group_ids: Tensor | None = None,
+        query_to_support: Tensor | None = None,
+        threshold: float = 0.0,
+    ) -> list[dict[str, Tensor]]:
+        """Batched few-shot inference; outputs are scaled to each query image size."""
+        device = next(self.parameters()).device
+        support_images = support_images.to(device)
+        query_images = query_images.to(device)
+        support_boxes = support_boxes.to(device)
+        if support_boxes.ndim == 2:
+            support_boxes = support_boxes[:, None, :]
+        resolution = self.detector.backbone[0].encoder.shape[-1]
+        support_images = TF.resize(support_images, [resolution, resolution])
+        query_sizes = [(image.shape[-2], image.shape[-1]) for image in query_images]
+        query_images_resized = TF.resize(query_images, [resolution, resolution])
+        outputs = self.forward_support_query(
+            support_images,
+            support_boxes,
+            query_images_resized,
+            support_group_ids=support_group_ids,
+            query_to_support=query_to_support,
+        )
+        scores_all = outputs["pred_logits"].sigmoid()[..., 0]
+        boxes_all = box_cxcywh_to_xyxy(outputs["pred_boxes"])
+        results: list[dict[str, Tensor]] = []
+        for batch_index, (height, width) in enumerate(query_sizes):
+            scores = scores_all[batch_index]
+            keep = scores >= threshold
+            boxes = boxes_all[batch_index, keep]
+            scale = boxes.new_tensor([width, height, width, height])
+            results.append({"scores": scores[keep].cpu(), "boxes": (boxes * scale).cpu().clamp_min(0)})
+        return results
+
     def loss(self, outputs: dict[str, Tensor], target_boxes: Tensor, target_present: Tensor) -> dict[str, Tensor]:
-        """Compute binary objectness, L1 box, and generalized-IoU losses."""
-        target_present = target_present.to(outputs["pred_logits"].dtype).unsqueeze(-1)
+        """Compute binary objectness and matched L1/GIoU losses.
+
+        For same-image prompt mode, each provided box is a query and target_present
+        corresponds to each prompt. For support/query mode, target_present is one
+        concept-presence label per image; the highest-IoU decoder query is matched to
+        its GT box and every unmatched query is trained as background.
+        """
         logits = outputs["pred_logits"]
-        loss_objectness = torch.nn.functional.binary_cross_entropy_with_logits(logits, target_present)
-        positive = target_present.squeeze(-1) > 0.5
-        if positive.any():
-            predicted, target = outputs["pred_boxes"][positive], target_boxes[positive]
-            loss_bbox = torch.nn.functional.l1_loss(predicted, target)
-            giou = _generalized_box_iou(box_cxcywh_to_xyxy(predicted), box_cxcywh_to_xyxy(target))
+        target_present = target_present.to(logits.dtype)
+        if target_present.ndim == 1:
+            target_present = target_present[:, None]
+        if target_present.ndim == 2 and target_present.shape[1] == logits.shape[1]:
+            labels = target_present.unsqueeze(-1)
+            target_boxes_expanded = target_boxes
+            matched_predictions = outputs["pred_boxes"][labels[..., 0] > 0.5]
+            matched_targets = target_boxes_expanded[labels[..., 0] > 0.5]
+        else:
+            batch_size, query_count = logits.shape[:2]
+            labels = logits.new_zeros(batch_size, query_count, 1)
+            matched_predictions_list = []
+            matched_targets_list = []
+            gt_present = target_present.reshape(batch_size, -1).max(dim=1).values > 0.5
+            for batch_index in range(batch_size):
+                if not bool(gt_present[batch_index]):
+                    continue
+                gt_box = target_boxes[batch_index].reshape(-1, 4)[0]
+                predicted_xyxy = box_cxcywh_to_xyxy(outputs["pred_boxes"][batch_index])
+                target_xyxy = box_cxcywh_to_xyxy(gt_box[None])
+                ious = _generalized_box_iou(predicted_xyxy, target_xyxy).squeeze(-1)
+                best_query = int(ious.argmax())
+                labels[batch_index, best_query, 0] = 1
+                matched_predictions_list.append(outputs["pred_boxes"][batch_index, best_query])
+                matched_targets_list.append(gt_box)
+            matched_predictions = torch.stack(matched_predictions_list) if matched_predictions_list else logits.new_zeros(0, 4)
+            matched_targets = torch.stack(matched_targets_list) if matched_targets_list else logits.new_zeros(0, 4)
+        loss_objectness = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
+        positive = labels[..., 0] > 0.5
+        if matched_predictions.numel() > 0:
+            loss_bbox = torch.nn.functional.l1_loss(matched_predictions, matched_targets)
+            giou = _generalized_box_iou(box_cxcywh_to_xyxy(matched_predictions), box_cxcywh_to_xyxy(matched_targets))
             loss_giou = (1.0 - torch.diag(giou)).mean()
         else:
             loss_bbox = logits.sum() * 0.0

@@ -1,0 +1,1 @@
+Validated same-image prompt baseline with train, periodic seen validation, held-out evaluation, and metrics output. Backup created before support/query architecture changes.

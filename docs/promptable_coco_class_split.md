@@ -1,5 +1,9 @@
 # Promptable COCO Class-Split Experiment
 
+> **Historical v1 only:** this runbook evaluates same-image box prompts, where the query image supplies its own ground-truth box. It is not cross-image visual few-shot detection and its IoU must not be reported as unseen-class recognition. The frozen v1 implementation is under `experiments/promptable_v1/`. For support-image/box prompts applied to separate query images, use [the few-shot runbook](promptable_fewshot.md).
+
+For the complete current reproduction commands and status, see [the reproducibility report](promptable_reproduction_report.md).
+
 This experiment deliberately separates classes seen during training from classes used at test time.
 
 ## Already Built
@@ -19,7 +23,7 @@ The RF-DETR detection task is initialized from scratch with `pretrain_weights=No
 
 ## Configuration
 
-Preset: `configs/promptable_coco_class_split.yaml`
+Python preset: `configs/promptable_coco_class_split.py` (`cfg` values can be overridden with argparse flags).
 
 The preset selects:
 
@@ -44,14 +48,10 @@ Run from the repository root.
 
 ```bash
 uv run python scripts/generate_coco_prompt_split.py \
-  --train-source-annotation datasets/mscoco/annotations_trainval2017/annotations/instances_train2017.json \
-  --validation-source-annotation datasets/mscoco/annotations_trainval2017/annotations/instances_val2017.json \
-  --output-dir datasets/mscoco_prompt_split \
-  --train-classes 1 3 8 9 10 11 13 14 15 16 \
-  --test-classes 17 18 19 20 21 22 23 24 25 27 \
-  --train-images 10000 \
-  --seed 7
+  --config configs/promptable_coco_class_split.py
 ```
+
+Pass any generator options directly to override the preset; for example, add `--seed 11 --train-images 5000`.
 
 Expected output reports training, seen-validation, and unseen-test image/annotation counts. It writes `train.json`, `seen_val.json`, and `unseen_test.json`.
 
@@ -59,14 +59,11 @@ Expected output reports training, seen-validation, and unseen-test image/annotat
 
 ```bash
 uv run python scripts/train_promptable_rfdetr.py \
-  --image-dir datasets/mscoco/train2017 \
-  --annotation-file datasets/mscoco_prompt_split/train.json \
-  --steps 10000 \
-  --batch-size 1 \
-  --resolution 560 \
-  --device cuda \
-  --output logs/promptable_coco_class_split.pt
+  --config configs/promptable_same_image_baseline.py \
+  --device cuda
 ```
+
+Any option can be overridden on the command line, for example `--steps 20000`.
 
 For a practical run, use a CUDA device and increase `--steps` substantially, for example `10000` or more.
 
