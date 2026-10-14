@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import numpy as np
 import torch
 from PIL import Image
+from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 from torchvision.ops import roi_align
 from torchvision.transforms import functional as TF
@@ -14,7 +15,7 @@ from torchvision.transforms import functional as TF
 from rfdetr_promptable.config import ModelConfig, TrainConfig
 from rfdetr_promptable.models.lwdetr import LWDETR, build_model_from_config
 from rfdetr_promptable.utilities.box_ops import box_cxcywh_to_xyxy
-from rfdetr_promptable.utilities.tensors import nested_tensor_from_tensor_list
+from rfdetr_promptable.utilities.tensors import NestedTensor, nested_tensor_from_tensor_list
 
 
 def _inverse_sigmoid(value: Tensor, eps: float = 1e-5) -> Tensor:
@@ -89,6 +90,134 @@ class PromptableDetector(nn.Module):
         hs_last, ref_last = hs[-1], references[-1]
         pred_boxes = (self.detector.bbox_embed(hs_last) + ref_last).sigmoid()
         return {"pred_logits": self.objectness(hs_last), "pred_boxes": pred_boxes}
+
+    def forward_same_image(self, images: Tensor, prompt_boxes: Tensor) -> dict[str, Tensor]:
+        """Use a box on each image as a visual example to detect its other instances.
+
+        The backbone runs once per image. The prompt ROI is pooled from that same
+        feature map, then fused into independent detection queries over the map.
+        """
+        if images.ndim != 4 or prompt_boxes.shape != (images.shape[0], 4):
+            raise ValueError("Expected images [B,3,H,W] and prompt_boxes [B,4].")
+        nested = nested_tensor_from_tensor_list(images)
+        features, positions, cross_attn_features = self.detector.backbone(nested)
+        srcs, masks = [], []
+        for feature in features:
+            src, mask = feature.decompose()
+            srcs.append(src)
+            masks.append(mask)
+        cross_attn_srcs = None if cross_attn_features is None else [f.decompose()[0] for f in cross_attn_features]
+
+        feature_map = features[-1].tensors
+        batch_size, _, feature_height, feature_width = feature_map.shape
+        boxes = prompt_boxes.to(device=feature_map.device, dtype=feature_map.dtype)
+        input_height, input_width = images.shape[-2:]
+        xyxy = torch.stack(
+            [boxes[:, 0] - boxes[:, 2] / 2, boxes[:, 1] - boxes[:, 3] / 2,
+             boxes[:, 0] + boxes[:, 2] / 2, boxes[:, 1] + boxes[:, 3] / 2], dim=-1
+        )
+        rois = torch.cat(
+            [torch.arange(batch_size, device=feature_map.device, dtype=boxes.dtype)[:, None],
+             xyxy * boxes.new_tensor([input_width, input_height, input_width, input_height])], dim=-1
+        )
+        roi_features = roi_align(
+            feature_map, rois, output_size=(3, 3),
+            spatial_scale=(feature_width / input_width + feature_height / input_height) / 2,
+            aligned=True,
+        ).mean(dim=(-1, -2))
+        support_token = self.support_roi_encoder(roi_features) + self.prompt_encoder(boxes)
+
+        query_count = self.detector.num_queries
+        base_query = self.detector.query_feat.weight[:query_count].expand(batch_size, query_count, -1)
+        concept = support_token[:, None, :].expand(-1, query_count, -1)
+        ref_logits = self.detector.refpoint_embed.weight[:query_count].unsqueeze(0).expand(batch_size, -1, -1)
+        geometry = self.prompt_encoder(ref_logits.sigmoid())
+        dynamic_query = base_query + self.support_fusion(torch.cat([concept, geometry], dim=-1))
+        transformer_outputs = self.detector.transformer(
+            srcs, masks, positions, ref_logits, dynamic_query, cross_attn_srcs=cross_attn_srcs
+        )
+        hs, references = transformer_outputs[:2]
+        if hs is None or references is None:
+            raise RuntimeError("Same-image prompted detection requires decoder layers.")
+        hs_last, ref_last = hs[-1], references[-1]
+        pred_boxes = (self.detector.bbox_embed(hs_last) + ref_last).sigmoid()
+        return {"pred_logits": self.objectness(hs_last), "pred_boxes": pred_boxes}
+
+    def forward_batched_support_query(
+        self, support_images: Tensor, support_boxes: Tensor, query_images: Tensor
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        """Encode paired support/query images in one batch, then condition query decoding.
+
+        Images remain separate batch elements, so backbone self-attention never sees
+        a spatially stitched mega-image. Support and query predictions share one
+        backbone pass; the support output supplies an auxiliary prompt-box detection
+        loss while the query output supplies the cross-image transfer loss.
+        """
+        if support_images.shape != query_images.shape or support_boxes.shape != (support_images.shape[0], 4):
+            raise ValueError("Paired support/query images must match [B,3,H,W] and support boxes [B,4].")
+        batch_size = support_images.shape[0]
+        joined = torch.cat([support_images, query_images], dim=0)
+        features, positions, cross = self.detector.backbone(nested_tensor_from_tensor_list(joined))
+
+        def split_features(start: int, end: int):
+            return [
+                NestedTensor(f.tensors[start:end], None if f.mask is None else f.mask[start:end])
+                for f in features
+            ]
+
+        support_features = split_features(0, batch_size)
+        query_features = split_features(batch_size, batch_size * 2)
+        support_positions = [p[:batch_size] for p in positions]
+        query_positions = [p[batch_size:] for p in positions]
+        if cross is None:
+            support_cross = query_cross = None
+        else:
+            support_cross = [NestedTensor(f.tensors[:batch_size], None if f.mask is None else f.mask[:batch_size]) for f in cross]
+            query_cross = [NestedTensor(f.tensors[batch_size:], None if f.mask is None else f.mask[batch_size:]) for f in cross]
+
+        support_map = support_features[-1].tensors
+        _, _, feature_h, feature_w = support_map.shape
+        boxes = support_boxes.to(device=support_map.device, dtype=support_map.dtype)
+        input_h, input_w = support_images.shape[-2:]
+        xyxy = torch.stack(
+            [boxes[:, 0] - boxes[:, 2] / 2, boxes[:, 1] - boxes[:, 3] / 2,
+             boxes[:, 0] + boxes[:, 2] / 2, boxes[:, 1] + boxes[:, 3] / 2], dim=-1
+        )
+        rois = torch.cat(
+            [torch.arange(batch_size, device=boxes.device, dtype=boxes.dtype)[:, None],
+             xyxy * boxes.new_tensor([input_w, input_h, input_w, input_h])], dim=-1
+        )
+        roi = roi_align(
+            support_map, rois, output_size=(3, 3),
+            spatial_scale=(feature_w / input_w + feature_h / input_h) / 2, aligned=True,
+        ).mean(dim=(-1, -2))
+        token = self.support_roi_encoder(roi) + self.prompt_encoder(boxes)
+
+        support_outputs = self._decode_with_prompt_token(support_features, support_positions, support_cross, token)
+        query_outputs = self._decode_with_prompt_token(query_features, query_positions, query_cross, token)
+        return support_outputs, query_outputs
+
+    def _decode_with_prompt_token(self, features, positions, cross_features, prompt_token: Tensor) -> dict[str, Tensor]:
+        srcs, masks = [], []
+        for feature in features:
+            src, mask = feature.decompose()
+            srcs.append(src)
+            masks.append(mask)
+        cross_srcs = None if cross_features is None else [f.decompose()[0] for f in cross_features]
+        batch_size = prompt_token.shape[0]
+        query_count = self.detector.num_queries
+        base = self.detector.query_feat.weight[:query_count].expand(batch_size, query_count, -1)
+        concept = prompt_token[:, None, :].expand(-1, query_count, -1)
+        ref_logits = self.detector.refpoint_embed.weight[:query_count].unsqueeze(0).expand(batch_size, -1, -1)
+        geometry = self.prompt_encoder(ref_logits.sigmoid())
+        query = base + self.support_fusion(torch.cat([concept, geometry], dim=-1))
+        hs, references = self.detector.transformer(
+            srcs, masks, positions, ref_logits, query, cross_attn_srcs=cross_srcs
+        )[:2]
+        if hs is None or references is None:
+            raise RuntimeError("Prompt-conditioned detection requires decoder layers.")
+        boxes = (self.detector.bbox_embed(hs[-1]) + references[-1]).sigmoid()
+        return {"pred_logits": self.objectness(hs[-1]), "pred_boxes": boxes}
 
     def encode_support(
         self,
@@ -214,16 +343,21 @@ class PromptableDetector(nn.Module):
         concept_tokens = concept_tokens[:, None, :].expand(-1, prompt_count, -1)
         # Use independent learned DETR references. Neither support box nor query GT
         # coordinates are reused as query-image locations.
-        query_reference = self.detector.refpoint_embed.weight[:prompt_count].unsqueeze(0).expand(
+        # LW-DETR stores learned references as unconstrained logits (they are
+        # initialized to zero). Use their sigmoid only as normalized geometry
+        # for the support prompt encoder, and pass the original logits to the
+        # transformer. Applying inverse-sigmoid here clamps zero logits to an
+        # almost-zero coordinate and collapses every decoded box at the origin.
+        query_reference_logits = self.detector.refpoint_embed.weight[:prompt_count].unsqueeze(0).expand(
             query_count, -1, -1
         )
-        query_geometry = self.prompt_encoder(query_reference)
+        query_geometry = self.prompt_encoder(query_reference_logits.sigmoid())
         dynamic_query = base_query + self.support_fusion(torch.cat([concept_tokens, query_geometry], dim=-1))
         transformer_outputs = self.detector.transformer(
             query_srcs,
             query_masks,
             query_positions,
-            _inverse_sigmoid(query_reference),
+            query_reference_logits,
             dynamic_query,
             cross_attn_srcs=query_cross_srcs,
         )
@@ -273,52 +407,146 @@ class PromptableDetector(nn.Module):
             results.append({"scores": scores[keep].cpu(), "boxes": (boxes * scale).cpu().clamp_min(0)})
         return results
 
-    def loss(self, outputs: dict[str, Tensor], target_boxes: Tensor, target_present: Tensor) -> dict[str, Tensor]:
-        """Compute binary objectness and matched L1/GIoU losses.
+    def loss(
+        self,
+        outputs: dict[str, Tensor],
+        target_boxes: Tensor,
+        target_present: Tensor,
+        target_mask: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Compute balanced objectness and one-to-one matched L1/GIoU losses.
 
         For same-image prompt mode, each provided box is a query and target_present
         corresponds to each prompt. For support/query mode, target_present is one
-        concept-presence label per image; the highest-IoU decoder query is matched to
-        its GT box and every unmatched query is trained as background.
+        concept-presence label per image; Hungarian assignment matches distinct
+        decoder queries to every valid GT box and unmatched queries are background.
         """
         logits = outputs["pred_logits"]
-        target_present = target_present.to(logits.dtype)
-        if target_present.ndim == 1:
-            target_present = target_present[:, None]
-        if target_present.ndim == 2 and target_present.shape[1] == logits.shape[1]:
-            labels = target_present.unsqueeze(-1)
-            target_boxes_expanded = target_boxes
-            matched_predictions = outputs["pred_boxes"][labels[..., 0] > 0.5]
-            matched_targets = target_boxes_expanded[labels[..., 0] > 0.5]
+        pred_boxes = outputs["pred_boxes"]
+        batch_size, query_count = logits.shape[:2]
+        target_present = target_present.to(logits.device)
+
+        # Same-image prompted mode provides one output query per prompt and labels
+        # already aligned to those queries. Support/query mode instead uses
+        # Hungarian matching between every predicted query and every valid GT box.
+        aligned_labels = target_present.ndim == 2 and target_present.shape[1] == query_count
+        if aligned_labels:
+            labels = target_present.to(logits.dtype).unsqueeze(-1)
+            matched_predictions = pred_boxes[labels[..., 0] > 0.5]
+            matched_targets = target_boxes.to(pred_boxes.device)[labels[..., 0] > 0.5]
         else:
-            batch_size, query_count = logits.shape[:2]
+            target_boxes = target_boxes.to(pred_boxes.device)
+            if target_mask is None:
+                target_mask = target_present.reshape(batch_size, -1)[:, :1] > 0.5
+                if target_boxes.shape[1] > 1:
+                    target_mask = target_mask.expand(-1, target_boxes.shape[1])
+            target_mask = target_mask.to(device=pred_boxes.device, dtype=torch.bool)
+            if target_mask.shape != target_boxes.shape[:2]:
+                raise ValueError(
+                    f"target_mask must have shape {tuple(target_boxes.shape[:2])}, got {tuple(target_mask.shape)}"
+                )
             labels = logits.new_zeros(batch_size, query_count, 1)
             matched_predictions_list = []
             matched_targets_list = []
-            gt_present = target_present.reshape(batch_size, -1).max(dim=1).values > 0.5
             for batch_index in range(batch_size):
-                if not bool(gt_present[batch_index]):
+                gt_boxes = target_boxes[batch_index, target_mask[batch_index]]
+                if gt_boxes.numel() == 0:
                     continue
-                gt_box = target_boxes[batch_index].reshape(-1, 4)[0]
-                predicted_xyxy = box_cxcywh_to_xyxy(outputs["pred_boxes"][batch_index])
-                target_xyxy = box_cxcywh_to_xyxy(gt_box[None])
-                ious = _generalized_box_iou(predicted_xyxy, target_xyxy).squeeze(-1)
-                best_query = int(ious.argmax())
-                labels[batch_index, best_query, 0] = 1
-                matched_predictions_list.append(outputs["pred_boxes"][batch_index, best_query])
-                matched_targets_list.append(gt_box)
-            matched_predictions = torch.stack(matched_predictions_list) if matched_predictions_list else logits.new_zeros(0, 4)
-            matched_targets = torch.stack(matched_targets_list) if matched_targets_list else logits.new_zeros(0, 4)
-        loss_objectness = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
+                predictions = pred_boxes[batch_index]
+                cost_l1 = torch.cdist(predictions, gt_boxes, p=1)
+                cost_giou = 1.0 - _generalized_box_iou(
+                    box_cxcywh_to_xyxy(predictions), box_cxcywh_to_xyxy(gt_boxes)
+                )
+                rows, columns = linear_sum_assignment((cost_l1 + 2.0 * cost_giou).detach().cpu().numpy())
+                rows_tensor = torch.as_tensor(rows, device=pred_boxes.device, dtype=torch.long)
+                columns_tensor = torch.as_tensor(columns, device=pred_boxes.device, dtype=torch.long)
+                labels[batch_index, rows_tensor, 0] = 1
+                matched_predictions_list.append(predictions[rows_tensor])
+                matched_targets_list.append(gt_boxes[columns_tensor])
+            matched_predictions = torch.cat(matched_predictions_list) if matched_predictions_list else pred_boxes.new_zeros(0, 4)
+            matched_targets = torch.cat(matched_targets_list) if matched_targets_list else pred_boxes.new_zeros(0, 4)
+
+        # Compute focal loss separately over positives and negatives so adding
+        # queries cannot dilute the positive classification signal.
         positive = labels[..., 0] > 0.5
+        probability = logits.sigmoid()
+        cross_entropy = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+        p_t = probability * labels + (1.0 - probability) * (1.0 - labels)
+        alpha_t = 0.25 * labels + 0.75 * (1.0 - labels)
+        focal = alpha_t * (1.0 - p_t).pow(2.0) * cross_entropy
+        positive_loss = focal[..., 0][positive].mean() if positive.any() else logits.sum() * 0.0
+        negative_loss = focal[..., 0][~positive].mean() if (~positive).any() else logits.sum() * 0.0
+        loss_objectness = positive_loss + negative_loss
         if matched_predictions.numel() > 0:
             loss_bbox = torch.nn.functional.l1_loss(matched_predictions, matched_targets)
-            giou = _generalized_box_iou(box_cxcywh_to_xyxy(matched_predictions), box_cxcywh_to_xyxy(matched_targets))
+            matched_pred_xyxy = box_cxcywh_to_xyxy(matched_predictions)
+            matched_target_xyxy = box_cxcywh_to_xyxy(matched_targets)
+            giou = _generalized_box_iou(matched_pred_xyxy, matched_target_xyxy)
             loss_giou = (1.0 - torch.diag(giou)).mean()
+            intersection_lt = torch.maximum(matched_pred_xyxy[:, :2], matched_target_xyxy[:, :2])
+            intersection_rb = torch.minimum(matched_pred_xyxy[:, 2:], matched_target_xyxy[:, 2:])
+            intersection = (intersection_rb - intersection_lt).clamp_min(0).prod(dim=-1)
+            pred_area = (matched_pred_xyxy[:, 2:] - matched_pred_xyxy[:, :2]).clamp_min(0).prod(dim=-1)
+            target_area = (matched_target_xyxy[:, 2:] - matched_target_xyxy[:, :2]).clamp_min(0).prod(dim=-1)
+            matched_iou = (intersection / (pred_area + target_area - intersection).clamp_min(1e-6)).detach().mean()
         else:
             loss_bbox = logits.sum() * 0.0
             loss_giou = logits.sum() * 0.0
-        return {"loss_objectness": loss_objectness, "loss_bbox": loss_bbox, "loss_giou": loss_giou}
+            matched_iou = logits.sum() * 0.0
+        return {
+            "loss_objectness": loss_objectness,
+            "loss_objectness_positive": positive_loss.detach(),
+            "loss_objectness_negative": negative_loss.detach(),
+            "loss_bbox": loss_bbox,
+            "loss_giou": loss_giou,
+            "matched_iou": matched_iou,
+            "positive_score": probability[..., 0][positive].detach().mean() if positive.any() else logits.sum().detach() * 0.0,
+            "negative_score": probability[..., 0][~positive].detach().mean() if (~positive).any() else logits.sum().detach() * 0.0,
+            "pred_box_mean": pred_boxes.detach().mean(dim=(0, 1)),
+        }
+
+    @torch.inference_mode()
+    def predict_same_image(
+        self,
+        image: Image.Image | np.ndarray | Tensor,
+        prompt_boxes: Sequence[Sequence[float]],
+        threshold: float = 0.5,
+    ) -> dict[str, Tensor]:
+        """Find other prompted-category instances in the same image.
+
+        Prompt boxes use source-image pixel XYXY coordinates. Returned boxes use
+        the same coordinate system and are ranked by predicted objectness.
+        """
+        if isinstance(image, Image.Image):
+            width, height = image.size
+            tensor = TF.to_tensor(image)
+        elif isinstance(image, np.ndarray):
+            height, width = image.shape[:2]
+            tensor = TF.to_tensor(image)
+        else:
+            tensor = image.float()
+            if tensor.ndim != 3 or tensor.shape[0] not in (1, 3):
+                raise ValueError("Tensor image must have shape [C,H,W].")
+            _, height, width = tensor.shape
+            if tensor.max() > 1:
+                tensor = tensor / 255.0
+        boxes = torch.as_tensor(prompt_boxes, dtype=torch.float32)
+        if boxes.shape != (1, 4):
+            raise ValueError("Same-image inference currently expects one pixel XYXY prompt box.")
+        x0, y0, x1, y1 = boxes.unbind(dim=-1)
+        normalized = torch.stack(
+            [((x0 + x1) / (2 * width)), ((y0 + y1) / (2 * height)),
+             ((x1 - x0) / width), ((y1 - y0) / height)], dim=-1
+        )
+        resolution = self.detector.backbone[0].encoder.shape[-1]
+        tensor = TF.resize(tensor, [resolution, resolution]).unsqueeze(0)
+        device = next(self.parameters()).device
+        outputs = self.forward_same_image(tensor.to(device), normalized.to(device))
+        scores = outputs["pred_logits"][0, :, 0].sigmoid()
+        boxes_xyxy = box_cxcywh_to_xyxy(outputs["pred_boxes"][0])
+        keep = scores >= threshold
+        scale = boxes_xyxy.new_tensor([width, height, width, height])
+        return {"scores": scores[keep].cpu(), "boxes": (boxes_xyxy[keep] * scale).cpu().clamp_min(0)}
 
     @torch.inference_mode()
     def predict(

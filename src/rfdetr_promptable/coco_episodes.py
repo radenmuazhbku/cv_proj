@@ -16,11 +16,11 @@ from rfdetr_promptable.coco_prompt import COCO
 
 
 class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
-    """Create cross-image support/query episodes from COCO annotations.
+    """Create same-image visual-prompt episodes from COCO annotations.
 
-    A positive episode uses 1..max_shots support image/box examples of one category
-    and a different query image containing that category. A negative episode uses
-    support examples of the category and a query image with no annotation of it.
+    One instance box in an image is the visual prompt; the other instances of
+    that category in the same image are detection targets. Images must contain
+    at least two instances of the chosen category.
     """
 
     def __init__(
@@ -94,23 +94,25 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                 category_id for category_id in self.category_ids
                 if len(self.category_images.get(category_id, [])) >= 2
             ]
+        self.category_image_instances = {
+            category_id: {
+                image_id: [ann for ann in self.image_annotations[image_id] if ann["category_id"] == category_id]
+                for image_id in image_ids
+                if sum(ann["category_id"] == category_id for ann in self.image_annotations[image_id]) >= 2
+            }
+            for category_id, image_ids in self.category_images.items()
+        }
+        self.category_image_instances = {
+            category_id: records for category_id, records in self.category_image_instances.items() if records
+        }
+        self.category_ids = sorted(self.category_image_instances)
         if not self.category_ids:
-            raise ValueError("COCO annotation subset needs at least one category in two or more images")
+            raise ValueError("COCO annotation subset needs an image with at least two instances of one category")
         self.eval_records: list[tuple[int, int, bool]] = []
         if not training:
             for category_id in self.category_ids:
                 self.eval_records.extend(
-                    (category_id, image_id, True) for image_id in self.category_images[category_id]
-                )
-                absent_image_ids = [
-                    image_id
-                    for image_id in sorted(self.image_categories)
-                    if category_id not in self.image_categories[image_id]
-                ]
-                absent_image_ids.sort(key=lambda image_id: (self.seed * 1_000_003 + image_id) % 2**32)
-                self.eval_records.extend(
-                    (category_id, image_id, False)
-                    for image_id in absent_image_ids[: self.negative_eval_per_class]
+                    (category_id, image_id, True) for image_id in sorted(self.category_image_instances[category_id])
                 )
 
     def __len__(self) -> int:
@@ -139,95 +141,45 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
         rng = random.Random(self.seed + index)
         if self.training:
             category_id, fixed_query_id = self._sample_training_category(rng)
-            positive_episode = False
+            positive_episode = True
         else:
             category_id, fixed_query_id, positive_episode = self.eval_records[index]
-        category_image_ids = self.category_images[category_id]
         if self.training:
-            shot_count = rng.randint(1, min(self.max_shots, len(category_image_ids) - 1))
-            positive_episode = rng.random() >= self.negative_ratio / (1.0 + self.negative_ratio)
-            if positive_episode:
-                query_id = rng.choice(category_image_ids)
-                support_pool = [image_id for image_id in category_image_ids if image_id != query_id]
-                shot_count = min(shot_count, len(support_pool))
-                support_ids = rng.sample(support_pool, shot_count)
-            else:
-                support_ids = rng.sample(category_image_ids, shot_count)
-                support_set = set(support_ids)
-                query_candidates = [
-                    image_id
-                    for image_id, present_categories in self.image_categories.items()
-                    if image_id not in support_set and category_id not in present_categories
-                ]
-                if not query_candidates:
-                    positive_episode = True
-                    query_id = rng.choice(category_image_ids)
-                    support_pool = [image_id for image_id in category_image_ids if image_id != query_id]
-                    support_ids = rng.sample(support_pool, min(shot_count, len(support_pool)))
-                else:
-                    query_id = rng.choice(query_candidates)
+            query_id = rng.choice(sorted(self.category_image_instances[category_id]))
         else:
             query_id = fixed_query_id
-            if self.has_separate_support:
-                support_pool = self.support_category_images[category_id]
-                support_ids = sorted(
-                    support_pool,
-                    key=lambda image_id: (self.seed * 1_000_003 + image_id) % 2**32,
-                )[: self.max_shots]
-            else:
-                support_pool = [image_id for image_id in category_image_ids if image_id != query_id]
-                support_ids = sorted(
-                    support_pool,
-                    key=lambda image_id: (self.seed * 1_000_003 + image_id) % 2**32,
-                )[: self.max_shots]
-            shot_count = len(support_ids)
-
-        support_images, support_boxes = [], []
-        for support_id in support_ids:
-            support_annotations = (
-                self.support_image_annotations if self.has_separate_support else self.image_annotations
-            )
-            annotations = [ann for ann in support_annotations[support_id] if ann["category_id"] == category_id]
-            annotation = rng.choice(annotations)
-            tensor, width, height = self._load_tensor(support_id, support=self.has_separate_support)
-            support_images.append(tensor)
-            support_boxes.append(self._normalize_box(annotation["bbox"], width, height))
-
+        annotations = self.category_image_instances[category_id][query_id]
+        prompt_index = rng.randrange(len(annotations)) if self.training else (
+            (self.seed + query_id + category_id) % len(annotations)
+        )
+        prompt_annotation = annotations[prompt_index]
+        target_annotations = [ann for ann in annotations if ann["id"] != prompt_annotation["id"]]
         query_tensor, query_width, query_height = self._load_tensor(query_id)
-        if positive_episode:
-            targets = [ann for ann in self.image_annotations[query_id] if ann["category_id"] == category_id]
-            target_boxes = torch.stack(
-                [self._normalize_box(ann["bbox"], query_width, query_height) for ann in targets]
-            )
-            target_box = target_boxes[rng.randrange(len(target_boxes))]
-            present = 1.0
-        else:
-            target_box = torch.tensor([0.5, 0.5, 0.0, 0.0], dtype=torch.float32)
-            target_boxes = target_box[None, :]
-            present = 0.0
+        prompt_box = self._normalize_box(prompt_annotation["bbox"], query_width, query_height)
+        target_boxes = torch.stack(
+            [self._normalize_box(ann["bbox"], query_width, query_height) for ann in target_annotations]
+        )
+        present = 1.0
         return {
-            "support_images": torch.stack(support_images),
-            "support_boxes": torch.stack(support_boxes),
+            "support_images": query_tensor.unsqueeze(0),
+            "support_boxes": prompt_box.unsqueeze(0),
             "query_image": query_tensor,
-            "target_box": target_box,
+            "target_box": target_boxes[0],
             "target_boxes": target_boxes,
             "present": present,
             "category_id": category_id,
             "query_image_id": query_id,
-            "support_image_ids": support_ids,
+            "support_image_ids": [query_id],
+            "prompt_annotation_id": prompt_annotation["id"],
         }
 
     def _sample_training_category(self, rng: random.Random) -> tuple[int, int]:
-        return rng.choice(self.category_ids), -1
+        category_id = rng.choice(self.category_ids)
+        return category_id, -1
 
 
 def collate_few_shot(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Flatten variable-shot support sets and retain query-to-concept assignments."""
-    support_images = torch.cat([item["support_images"] for item in batch], dim=0)
-    support_boxes = torch.cat([item["support_boxes"] for item in batch], dim=0)
-    support_group_ids = torch.cat(
-        [torch.full((item["support_images"].shape[0],), index, dtype=torch.long) for index, item in enumerate(batch)]
-    )
     max_targets = max(item["target_boxes"].shape[0] for item in batch)
     query_eval_boxes = torch.zeros((len(batch), max_targets, 4), dtype=torch.float32)
     query_eval_counts = torch.zeros(len(batch), dtype=torch.long)
@@ -236,16 +188,17 @@ def collate_few_shot(batch: list[dict[str, Any]]) -> dict[str, Any]:
         query_eval_boxes[index, : target_boxes.shape[0]] = target_boxes
         query_eval_counts[index] = target_boxes.shape[0] if item["present"] else 0
     return {
-        "support_images": support_images,
-        "support_boxes": support_boxes,
-        "support_group_ids": support_group_ids,
+        "support_boxes": torch.stack([item["support_boxes"][0] for item in batch]),
         "query_images": torch.stack([item["query_image"] for item in batch]),
-        "query_boxes": torch.stack([item["target_box"] for item in batch])[:, None, :],
+        "query_boxes": query_eval_boxes,
+        "query_target_mask": query_eval_counts.gt(0).unsqueeze(1) & (
+            torch.arange(max_targets).unsqueeze(0) < query_eval_counts.unsqueeze(1)
+        ),
         "query_eval_boxes": query_eval_boxes,
         "query_eval_counts": query_eval_counts,
         "present": torch.tensor([[item["present"]] for item in batch], dtype=torch.float32),
-        "query_to_support": torch.arange(len(batch), dtype=torch.long),
         "category_ids": [item["category_id"] for item in batch],
         "query_image_ids": [item["query_image_id"] for item in batch],
         "support_image_ids": [item["support_image_ids"] for item in batch],
+        "prompt_annotation_ids": [item["prompt_annotation_id"] for item in batch],
     }

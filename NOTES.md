@@ -1,0 +1,1 @@
+uv run python -c 'import fiftyone as fo; ds=fo.Dataset.from_dir(dataset_type=fo.types.COCODetectionDataset,data_path="/home/muaz/datasets/FetSelect_Dataset/",labels_path="/home/muaz/datasets/FetSelect_Dataset/crl_dataset.json"); fo.launch_app(ds).wait()'

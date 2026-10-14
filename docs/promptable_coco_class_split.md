@@ -47,8 +47,8 @@ Run from the repository root.
 ### 1. Generate filtered annotations
 
 ```bash
-uv run python scripts/generate_coco_prompt_split.py \
-  --config configs/promptable_coco_class_split.py
+uv run python scripts/rfdetr_promptable/generate_coco_prompt_split.py \
+  --config configs/rfdetr_promptable/promptable_coco_class_split.py
 ```
 
 Pass any generator options directly to override the preset; for example, add `--seed 11 --train-images 5000`.
@@ -58,8 +58,8 @@ Expected output reports train, seen/unseen support, and seen/unseen query image/
 ### 2. Train on the seen classes
 
 ```bash
-uv run python scripts/train_promptable_rfdetr.py \
-  --config configs/promptable_same_image_baseline.py \
+uv run python scripts/rfdetr_promptable/train_promptable_rfdetr.py \
+  --config configs/rfdetr_promptable/promptable_same_image_baseline.py \
   --device cuda
 ```
 
@@ -70,7 +70,7 @@ For a practical run, use a CUDA device and increase `--steps` substantially, for
 ### 3. Evaluate prompted held-out classes
 
 ```bash
-uv run python scripts/evaluate_promptable_rfdetr.py \
+uv run python scripts/rfdetr_promptable/evaluate_promptable_rfdetr.py \
   --image-dir datasets/mscoco/val2017 \
   --annotation-file datasets/mscoco_prompt_split/unseen_test.json \
   --checkpoint logs/promptable_same_image_baseline.best.pt \
@@ -85,7 +85,7 @@ The evaluator supplies each held-out object box as the prompt and reports per-cl
 Run the same evaluation on seen validation classes:
 
 ```bash
-uv run python scripts/evaluate_promptable_rfdetr.py \
+uv run python scripts/rfdetr_promptable/evaluate_promptable_rfdetr.py \
   --image-dir datasets/mscoco/val2017 \
   --annotation-file datasets/mscoco_prompt_split/seen_val.json \
   --checkpoint logs/promptable_coco_class_split.pt \
@@ -98,7 +98,7 @@ uv run python scripts/evaluate_promptable_rfdetr.py \
 ### 4. Run the existing smoke test
 
 ```bash
-uv run python scripts/train_promptable_rfdetr.py \
+uv run python scripts/rfdetr_promptable/train_promptable_rfdetr.py \
   --device cpu \
   --split train2017 \
   --steps 1 \

@@ -1,4 +1,6 @@
-# Cross-image visual few-shot detection
+# Archived cross-image visual few-shot detection
+
+> Historical runbook for the previous separate-support/query task. The active training protocol now uses one image, a box prompt on one instance, and the remaining same-class instances as targets. See [same-image box-prompted detection](promptable_same_image.md). The earlier implementation is preserved in `archive/promptable_cross_image_20261014/`.
 
 For the full experiment status and command-by-command reproduction runbook, see [the reproducibility report](promptable_reproduction_report.md).
 

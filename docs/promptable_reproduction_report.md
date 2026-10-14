@@ -1,4 +1,6 @@
-# Promptable Detection: Reproduction Report and Runbook
+# Promptable Detection: Historical Cross-image Reproduction Runbook
+
+> This runbook describes the archived cross-image support/query experiments. The active same-image box-prompt protocol and completed diagnostic runs are documented in [promptable_same_image.md](promptable_same_image.md).
 
 This report consolidates the current implementation status, data protocol, expected outputs, and commands for reproducing the promptable COCO runs. Run commands from the repository root.
 
