@@ -164,6 +164,8 @@ def run_train_sanity_eval(
     device: torch.device,
     figure_dir: Path,
     step: int,
+    plot_mode: str = "overlay",
+    max_predictions: int = 0,
 ) -> dict[str, object]:
     """Evaluate fixed training episodes and save GT/prediction diagnostic panels."""
     subset = loader.dataset
@@ -194,24 +196,37 @@ def run_train_sanity_eval(
                 image_path = dataset.image_dir / metadata["file_name"]
                 image = Image.open(image_path).convert("RGB")
                 width, height = image.size
-                prediction_xyxy = _cxcywh_pixels(prediction, width, height)
+                prediction_count = (
+                    scores.shape[1]
+                    if max_predictions <= 0
+                    else min(max_predictions, scores.shape[1])
+                )
+                plot_scores, plot_indices = scores[item_index].topk(prediction_count)
+                plot_predictions = [
+                    _cxcywh_pixels(predicted_boxes[item_index, query_index], width, height)
+                    for query_index in plot_indices
+                ]
                 target_xyxy = [_cxcywh_pixels(target, width, height) for target in targets]
                 support_examples = _load_support_visuals(dataset, batch, item_index, category_names[category_id])
                 safe_class = category_names[category_id].replace(" ", "_")
-                sample_path = figure_dir / f"batch_{batch_index:03d}" / safe_class / f"{Path(metadata['file_name']).stem}.png"
-                sample_path.parent.mkdir(parents=True, exist_ok=True)
+                sample_root = figure_dir / f"batch_{batch_index:03d}"
+                sample_root.mkdir(parents=True, exist_ok=True)
                 summary = f"{category_names[category_id]} | {'positive' if target_count else 'negative'}"
                 if best_iou is not None:
                     summary += f" | best IoU={best_iou:.3f}"
-                _save_query_support_figure(
-                    sample_path,
-                    summary,
+                _save_episode_figures(
+                    sample_root,
+                    category_names[category_id],
+                    metadata["file_name"],
                     image,
+                    plot_predictions,
+                    plot_scores.detach().cpu().tolist(),
                     target_xyxy,
-                    prediction_xyxy,
-                    float(score),
                     support_examples,
+                    plot_mode=plot_mode,
                 )
+                sample_view = "overlay" if plot_mode == "overlay" else "support_query"
+                sample_path = sample_root / sample_view / safe_class / f"{Path(metadata['file_name']).stem}.png"
                 records.append(
                     {
                         "step": step,
@@ -222,6 +237,7 @@ def run_train_sanity_eval(
                         "score": float(score),
                         "best_iou": best_iou,
                         "prediction_cxcywh": prediction.detach().cpu().tolist(),
+                        "plotted_prediction_count": prediction_count,
                         "target_count": target_count,
                         "support_image_ids": [support_id for support_id, _, _, _ in support_examples],
                         "figure": str(sample_path),
@@ -324,11 +340,20 @@ def save_rfdetr_training_plots(
         writer.writerows(rows)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    figures = (
+    figures = [
         plot_metrics(metrics_csv, output_dir / "training_metrics.png"),
         plot_loss_metrics(metrics_csv, output_dir / "loss_metrics.png", loss_log_scale=True),
-        plot_map_metrics(metrics_csv, output_dir / "map_metrics.png"),
+    ]
+    map_columns = ("val/mAP_50", "val/mAP_50_95", "val/mAP_75")
+    has_map_values = any(
+        isinstance(row.get(column), (int, float))
+        for row in rows
+        for column in map_columns
     )
+    if has_map_values:
+        figures.append(plot_map_metrics(metrics_csv, output_dir / "map_metrics.png"))
+    else:
+        print("skipping RF-DETR mAP plot: this evaluation run has no COCO mAP metrics")
     import matplotlib.pyplot as plt
 
     for figure in figures:
@@ -382,6 +407,8 @@ def run_episode_eval(
     device: torch.device,
     figure_dir: Path | None = None,
     max_figures_per_class: int = 10,
+    plot_mode: str = "overlay",
+    max_predictions: int = 0,
 ) -> dict[str, object]:
     model.eval()
     by_category: dict[int, dict[str, object]] = {}
@@ -417,14 +444,27 @@ def run_episode_eval(
                         metadata = dataset.coco.loadImgs([int(batch["query_image_ids"][index])])[0]
                         image = Image.open(dataset.image_dir / metadata["file_name"]).convert("RGB")
                         width, height = image.size
-                        pred_xyxy = _cxcywh_pixels(pred_box, width, height)
-                        gt_xyxy = _cxcywh_pixels(gt_box, width, height)
+                        gt_boxes_xyxy = [
+                            _cxcywh_pixels(box, width, height) for box in gt_boxes
+                        ]
+                        prediction_count = (
+                            scores.shape[1]
+                            if max_predictions <= 0
+                            else min(max_predictions, scores.shape[1])
+                        )
+                        plot_scores, plot_indices = scores[index].topk(prediction_count)
+                        plot_predictions = [
+                            _cxcywh_pixels(outputs["pred_boxes"][index, query_index], width, height)
+                            for query_index in plot_indices
+                        ]
                         support_examples = _load_support_visuals(
                             dataset, batch, index, category_names[category_id]
                         )
                         _save_episode_figures(
                             figure_dir, category_names[category_id], metadata["file_name"], image,
-                            pred_xyxy, gt_xyxy, score, support_examples,
+                            plot_predictions, plot_scores.detach().cpu().tolist(),
+                            gt_boxes_xyxy, support_examples,
+                            plot_mode=plot_mode,
                         )
                         figure_counts[category_id] = figure_counts.get(category_id, 0) + 1
                 else:
@@ -717,17 +757,61 @@ def _save_query_support_figure(
     summary: str,
     query_image: Image.Image,
     target_boxes: list[list[float]],
-    prediction_box: list[float],
-    score: float,
+    prediction_boxes: list[list[float]],
+    prediction_scores: list[float],
     support_examples: list[tuple[int, Image.Image, list[float], str]],
+    plot_mode: str = "overlay",
 ) -> None:
     """Save query GT/prediction alongside the exact support images and prompt boxes."""
+    if plot_mode not in {"split", "overlay"}:
+        raise ValueError(f"Unknown inference plot mode: {plot_mode!r}")
+    if plot_mode == "overlay":
+        figure, axis = plt.subplots(figsize=(9, 7))
+        axis.imshow(query_image)
+        axis.set_title(f"Prompt, all query GT, {len(prediction_boxes)} predictions")
+        axis.axis("off")
+        for index, (_, _, prompt_box, _) in enumerate(support_examples):
+            x0, y0, x1, y1 = prompt_box
+            axis.add_patch(patches.Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                fill=False, edgecolor="cyan", linewidth=2,
+                label="prompt box" if index == 0 else None,
+            ))
+        for index, (x0, y0, x1, y1) in enumerate(target_boxes):
+            axis.add_patch(patches.Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                fill=False, edgecolor="lime", linewidth=2,
+                label="query GT" if index == 0 else None,
+            ))
+        for index, (box, score) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
+            x0, y0, x1, y1 = box
+            axis.add_patch(patches.Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                fill=False,
+                edgecolor="red" if index == 0 else "orange",
+                linewidth=2 if index == 0 else 1,
+                alpha=1.0 if index == 0 else 0.55,
+                label=f"top prediction {score:.2f}" if index == 0 else (
+                    "other predictions" if index == 1 else None
+                ),
+            ))
+        axis.legend(loc="upper right")
+        figure.suptitle(summary)
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=120, bbox_inches="tight")
+        plt.close(figure)
+        return
+
     support_count = len(support_examples)
     figure = plt.figure(figsize=(20, 9 if support_count <= 4 else 10))
     outer_grid = figure.add_gridspec(2, 1, height_ratios=(2.0, 1.25), hspace=0.18)
     query_grid = outer_grid[0].subgridspec(1, 4, wspace=0.04)
     query_axes = [figure.add_subplot(query_grid[0, index]) for index in range(4)]
-    titles = ("Query image", "Query ground truth", f"Top prediction ({score:.3f})", "GT + prediction")
+    top_score = prediction_scores[0]
+    titles = (
+        "Query image", "Query ground truth",
+        f"Top {len(prediction_boxes)} predictions (best {top_score:.3f})", "GT + predictions",
+    )
     for axis, title in zip(query_axes, titles, strict=True):
         axis.imshow(query_image)
         axis.set_title(title)
@@ -739,13 +823,26 @@ def _save_query_support_figure(
         query_axes[3].add_patch(
             patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="lime", linewidth=2, label="query GT")
         )
-    x0, y0, x1, y1 = prediction_box
-    query_axes[2].add_patch(
-        patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red", linewidth=2)
-    )
-    query_axes[3].add_patch(
-        patches.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red", linewidth=2, label="prediction")
-    )
+    for index, (box, score) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
+        x0, y0, x1, y1 = box
+        color = "red" if index == 0 else "orange"
+        linewidth = 2 if index == 0 else 1
+        alpha = 1.0 if index == 0 else 0.55
+        query_axes[2].add_patch(patches.Rectangle(
+            (x0, y0), x1 - x0, y1 - y0,
+            fill=False, edgecolor=color, linewidth=linewidth, alpha=alpha,
+            label=f"top prediction {score:.2f}" if index == 0 else (
+                "other predictions" if index == 1 else None
+            ),
+        ))
+        query_axes[3].add_patch(patches.Rectangle(
+            (x0, y0), x1 - x0, y1 - y0,
+            fill=False, edgecolor=color, linewidth=linewidth, alpha=alpha,
+            label=f"top prediction {score:.2f}" if index == 0 else (
+                "other predictions" if index == 1 else None
+            ),
+        ))
+    query_axes[2].legend(loc="upper right")
     query_axes[3].legend(loc="upper right")
 
     if support_examples:
@@ -774,34 +871,83 @@ def _save_query_support_figure(
 
 def _save_episode_figures(
     figure_dir: Path, class_name: str, filename: str, image: Image.Image,
-    prediction: list[float], target: list[float], score: float,
+    prediction_boxes: list[list[float]], prediction_scores: list[float],
+    target_boxes: list[list[float]],
     support_examples: list[tuple[int, Image.Image, list[float], str]],
+    plot_mode: str = "overlay",
 ) -> None:
     safe_name, stem = class_name.replace(" ", "_"), Path(filename).stem
-    view_dirs = {name: figure_dir / name / safe_name for name in ("original", "prediction", "prediction_gt")}
+    if plot_mode == "overlay":
+        overlay_dir = figure_dir / "overlay" / safe_name
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        _save_query_support_figure(
+            overlay_dir / f"{stem}.png",
+            f"{class_name} | prompt, all query GT, and all predictions",
+            image,
+            target_boxes,
+            prediction_boxes,
+            prediction_scores,
+            support_examples,
+            plot_mode="overlay",
+        )
+        return
+    if plot_mode != "split":
+        raise ValueError(f"Unknown inference plot mode: {plot_mode!r}")
+
+    view_dirs = {
+        name: figure_dir / name / safe_name
+        for name in ("original", "prediction", "prediction_gt")
+    }
     for directory in view_dirs.values():
         directory.mkdir(parents=True, exist_ok=True)
     image.save(view_dirs["original"] / f"{stem}.png")
-    for view in ("prediction", "prediction_gt"):
-        fig, axis = plt.subplots(figsize=(8, 6))
-        axis.imshow(image)
-        if view == "prediction_gt":
-            axis.add_patch(patches.Rectangle((target[0], target[1]), target[2] - target[0], target[3] - target[1], fill=False, edgecolor="green", linewidth=2, label="ground truth"))
-        axis.add_patch(patches.Rectangle((prediction[0], prediction[1]), prediction[2] - prediction[0], prediction[3] - prediction[1], fill=False, edgecolor="red", linewidth=2, label=f"prediction {score:.2f}"))
-        axis.axis("off")
-        axis.legend(loc="upper right")
-        fig.savefig(view_dirs[view] / f"{stem}.png", bbox_inches="tight", dpi=120)
-        plt.close(fig)
+    fig, axis = plt.subplots(figsize=(8, 6))
+    axis.imshow(image)
+    for index, (prediction, score) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
+        axis.add_patch(patches.Rectangle(
+            (prediction[0], prediction[1]), prediction[2] - prediction[0], prediction[3] - prediction[1],
+            fill=False, edgecolor="red" if index == 0 else "orange",
+            linewidth=2 if index == 0 else 1, alpha=1.0 if index == 0 else 0.55,
+            label=f"top prediction {score:.2f}" if index == 0 else (
+                "other predictions" if index == 1 else None
+            ),
+        ))
+    axis.axis("off")
+    axis.legend(loc="upper right")
+    fig.savefig(view_dirs["prediction"] / f"{stem}.png", bbox_inches="tight", dpi=120)
+    plt.close(fig)
+    fig, axis = plt.subplots(figsize=(8, 6))
+    axis.imshow(image)
+    for index, target in enumerate(target_boxes):
+        axis.add_patch(patches.Rectangle(
+            (target[0], target[1]), target[2] - target[0], target[3] - target[1],
+            fill=False, edgecolor="lime", linewidth=2,
+            label="ground truth" if index == 0 else None,
+        ))
+    for index, (prediction, score) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
+        axis.add_patch(patches.Rectangle(
+            (prediction[0], prediction[1]), prediction[2] - prediction[0], prediction[3] - prediction[1],
+            fill=False, edgecolor="red" if index == 0 else "orange",
+            linewidth=2 if index == 0 else 1, alpha=1.0 if index == 0 else 0.55,
+            label=f"top prediction {score:.2f}" if index == 0 else (
+                "other predictions" if index == 1 else None
+            ),
+        ))
+    axis.axis("off")
+    axis.legend(loc="upper right")
+    fig.savefig(view_dirs["prediction_gt"] / f"{stem}.png", bbox_inches="tight", dpi=120)
+    plt.close(fig)
     support_dir = figure_dir / "support_query" / safe_name
     support_dir.mkdir(parents=True, exist_ok=True)
     _save_query_support_figure(
         support_dir / f"{stem}.png",
         f"{class_name} | support examples with query GT and prediction",
         image,
-        [target],
-        prediction,
-        score,
+        target_boxes,
+        prediction_boxes,
+        prediction_scores,
         support_examples,
+        plot_mode="split",
     )
 
 
@@ -834,6 +980,8 @@ def main() -> None:
     parser.add_argument("--negative-ratio", type=float, default=0.5)
     parser.add_argument("--negative-eval-per-class", type=int, default=100)
     parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--batch-repeat", type=int, default=4,
+                        help="Optimizer updates to run on each sampled batch before loading the next; 1 matches the old loop.")
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--checkpoint-every-eval", action=argparse.BooleanOptionalAction, default=True,
                         help="Save a step-numbered model checkpoint after each evaluation (default: enabled).")
@@ -860,6 +1008,14 @@ def main() -> None:
                         help="Cosine schedule final LR as a fraction of --lr.")
     parser.add_argument("--figure-dir", type=Path, default=Path("logs/promptable_fewshot_figures"))
     parser.add_argument("--max-figures-per-class", type=int, default=10)
+    parser.add_argument(
+        "--inference-plot-mode", choices=("overlay", "split"), default="overlay",
+        help="overlay: one image with prompt, all query GT, and predictions (default); split: save separate views in folders.",
+    )
+    parser.add_argument(
+        "--inference-max-predictions", type=int, default=0,
+        help="Maximum scored boxes to draw; 0 draws every decoder query (default).",
+    )
     parser.add_argument("--selection-metric", choices=("episodic_iou",), default="episodic_iou")
     parser.add_argument("--coco-selection-images", type=int, default=500)
     parser.add_argument("--output", type=Path, default=Path("logs/promptable_fewshot.pt"))
@@ -869,6 +1025,10 @@ def main() -> None:
         parser.error("--log-every must be positive")
     if args.steps < 2:
         parser.error("--steps must be at least 2 for a learning-rate schedule")
+    if args.batch_repeat <= 0:
+        parser.error("--batch-repeat must be positive")
+    if args.inference_max_predictions < 0:
+        parser.error("--inference-max-predictions must be non-negative")
     if args.max_eval_checkpoints <= 0:
         parser.error("--max-eval-checkpoints must be positive")
     if not 0.0 <= args.warmup_start_factor <= 1.0:
@@ -973,6 +1133,11 @@ def main() -> None:
         f"lr schedule={args.lr_scheduler} base_lr={args.lr:.3g} warmup_steps={warmup_steps}/"
         f"{args.steps} warmup_start_factor={args.warmup_start_factor:g} min_lr_ratio={args.min_lr_ratio:g}"
     )
+    print(
+        f"batch repeat={args.batch_repeat}: each sampled batch gets up to "
+        f"{args.batch_repeat} optimizer updates before the next batch"
+    )
+    current_batch = None
     for step in progress:
         lr = _scheduled_lr(
             args.lr, step, args.steps, warmup_steps, args.warmup_start_factor,
@@ -980,11 +1145,13 @@ def main() -> None:
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        try:
-            batch = _move_batch(next(iterator), device)
-        except StopIteration:
-            iterator = iter(train_loader)
-            batch = _move_batch(next(iterator), device)
+        if current_batch is None or step % args.batch_repeat == 0:
+            try:
+                current_batch = _move_batch(next(iterator), device)
+            except StopIteration:
+                iterator = iter(train_loader)
+                current_batch = _move_batch(next(iterator), device)
+        batch = current_batch
         outputs = model.forward_same_image(batch["query_images"], batch["support_boxes"])
         losses = model.loss(
             outputs,
@@ -1061,6 +1228,8 @@ def main() -> None:
                     device,
                     args.figure_dir / "train_sanity" / f"step_{step + 1:06d}",
                     step + 1,
+                    plot_mode=args.inference_plot_mode,
+                    max_predictions=args.inference_max_predictions,
                 )
                 metrics[f"train_sanity_step_{step + 1}"] = sanity_result
                 with train_sanity_log_path.open("a", encoding="utf-8") as log_file:
@@ -1120,6 +1289,8 @@ def main() -> None:
     metrics["held_out_test"] = run_episode_eval(
         model, test_loader, device, figure_dir=args.figure_dir / "heldout_test",
         max_figures_per_class=args.max_figures_per_class,
+        plot_mode=args.inference_plot_mode,
+        max_predictions=args.inference_max_predictions,
     )
     metrics["metric_protocol"] = (
         "same-image visual prompting; one instance box is the prompt and the remaining "

@@ -92,13 +92,17 @@ class PromptableDetector(nn.Module):
         return {"pred_logits": self.objectness(hs_last), "pred_boxes": pred_boxes}
 
     def forward_same_image(self, images: Tensor, prompt_boxes: Tensor) -> dict[str, Tensor]:
-        """Use a box on each image as a visual example to detect its other instances.
+        """Use one or more box examples on each image to condition detection.
 
-        The backbone runs once per image. The prompt ROI is pooled from that same
-        feature map, then fused into independent detection queries over the map.
+        The backbone runs once per image. Prompt ROI features are pooled from the
+        shared map and averaged, then fused into independent detection queries.
+        For a spatially tiled support/query canvas, prompt boxes use coordinates
+        normalized to the entire canvas.
         """
-        if images.ndim != 4 or prompt_boxes.shape != (images.shape[0], 4):
-            raise ValueError("Expected images [B,3,H,W] and prompt_boxes [B,4].")
+        if prompt_boxes.ndim == 2:
+            prompt_boxes = prompt_boxes[:, None, :]
+        if images.ndim != 4 or prompt_boxes.ndim != 3 or prompt_boxes.shape[0] != images.shape[0] or prompt_boxes.shape[-1] != 4:
+            raise ValueError("Expected images [B,3,H,W] and prompt_boxes [B,S,4] (or [B,4]).")
         nested = nested_tensor_from_tensor_list(images)
         features, positions, cross_attn_features = self.detector.backbone(nested)
         srcs, masks = [], []
@@ -111,13 +115,14 @@ class PromptableDetector(nn.Module):
         feature_map = features[-1].tensors
         batch_size, _, feature_height, feature_width = feature_map.shape
         boxes = prompt_boxes.to(device=feature_map.device, dtype=feature_map.dtype)
+        shots = boxes.shape[1]
         input_height, input_width = images.shape[-2:]
         xyxy = torch.stack(
-            [boxes[:, 0] - boxes[:, 2] / 2, boxes[:, 1] - boxes[:, 3] / 2,
-             boxes[:, 0] + boxes[:, 2] / 2, boxes[:, 1] + boxes[:, 3] / 2], dim=-1
-        )
+            [boxes[..., 0] - boxes[..., 2] / 2, boxes[..., 1] - boxes[..., 3] / 2,
+             boxes[..., 0] + boxes[..., 2] / 2, boxes[..., 1] + boxes[..., 3] / 2], dim=-1
+        ).reshape(-1, 4)
         rois = torch.cat(
-            [torch.arange(batch_size, device=feature_map.device, dtype=boxes.dtype)[:, None],
+            [torch.arange(batch_size, device=feature_map.device, dtype=boxes.dtype).repeat_interleave(shots)[:, None],
              xyxy * boxes.new_tensor([input_width, input_height, input_width, input_height])], dim=-1
         )
         roi_features = roi_align(
@@ -125,7 +130,8 @@ class PromptableDetector(nn.Module):
             spatial_scale=(feature_width / input_width + feature_height / input_height) / 2,
             aligned=True,
         ).mean(dim=(-1, -2))
-        support_token = self.support_roi_encoder(roi_features) + self.prompt_encoder(boxes)
+        shot_tokens = self.support_roi_encoder(roi_features) + self.prompt_encoder(boxes.reshape(-1, 4))
+        support_token = shot_tokens.reshape(batch_size, shots, -1).mean(dim=1)
 
         query_count = self.detector.num_queries
         base_query = self.detector.query_feat.weight[:query_count].expand(batch_size, query_count, -1)
@@ -150,13 +156,26 @@ class PromptableDetector(nn.Module):
 
         Images remain separate batch elements, so backbone self-attention never sees
         a spatially stitched mega-image. Support and query predictions share one
-        backbone pass; the support output supplies an auxiliary prompt-box detection
-        loss while the query output supplies the cross-image transfer loss.
+        backbone pass; each support output can supply an auxiliary support-image
+        detection loss while the query output supplies the transfer loss.
         """
-        if support_images.shape != query_images.shape or support_boxes.shape != (support_images.shape[0], 4):
-            raise ValueError("Paired support/query images must match [B,3,H,W] and support boxes [B,4].")
-        batch_size = support_images.shape[0]
-        joined = torch.cat([support_images, query_images], dim=0)
+        return self.forward_multi_shot_support_query(
+            support_images[:, None] if support_images.ndim == 4 else support_images,
+            support_boxes[:, None] if support_boxes.ndim == 2 else support_boxes,
+            query_images,
+        )
+
+    def forward_multi_shot_support_query(
+        self, support_images: Tensor, support_boxes: Tensor, query_images: Tensor
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        """Batch all support shots and queries as separate images for one backbone pass."""
+        if support_images.ndim != 5 or query_images.ndim != 4:
+            raise ValueError("Expected support_images [B,S,3,H,W] and query_images [B,3,H,W].")
+        batch_size, shots, channels, height, width = support_images.shape
+        if query_images.shape != (batch_size, channels, height, width) or support_boxes.shape != (batch_size, shots, 4):
+            raise ValueError("Support/query image dimensions and support_boxes [B,S,4] must agree.")
+        flat_support = support_images.reshape(batch_size * shots, channels, height, width)
+        joined = torch.cat([flat_support, query_images], dim=0)
         features, positions, cross = self.detector.backbone(nested_tensor_from_tensor_list(joined))
 
         def split_features(start: int, end: int):
@@ -165,35 +184,39 @@ class PromptableDetector(nn.Module):
                 for f in features
             ]
 
-        support_features = split_features(0, batch_size)
-        query_features = split_features(batch_size, batch_size * 2)
-        support_positions = [p[:batch_size] for p in positions]
-        query_positions = [p[batch_size:] for p in positions]
+        support_count = batch_size * shots
+        support_features = split_features(0, support_count)
+        query_features = split_features(support_count, support_count + batch_size)
+        support_positions = [p[:support_count] for p in positions]
+        query_positions = [p[support_count:] for p in positions]
         if cross is None:
             support_cross = query_cross = None
         else:
-            support_cross = [NestedTensor(f.tensors[:batch_size], None if f.mask is None else f.mask[:batch_size]) for f in cross]
-            query_cross = [NestedTensor(f.tensors[batch_size:], None if f.mask is None else f.mask[batch_size:]) for f in cross]
+            support_cross = [NestedTensor(f.tensors[:support_count], None if f.mask is None else f.mask[:support_count]) for f in cross]
+            query_cross = [NestedTensor(f.tensors[support_count:], None if f.mask is None else f.mask[support_count:]) for f in cross]
 
         support_map = support_features[-1].tensors
         _, _, feature_h, feature_w = support_map.shape
-        boxes = support_boxes.to(device=support_map.device, dtype=support_map.dtype)
-        input_h, input_w = support_images.shape[-2:]
+        boxes = support_boxes.reshape(-1, 4).to(device=support_map.device, dtype=support_map.dtype)
+        input_h, input_w = height, width
         xyxy = torch.stack(
             [boxes[:, 0] - boxes[:, 2] / 2, boxes[:, 1] - boxes[:, 3] / 2,
              boxes[:, 0] + boxes[:, 2] / 2, boxes[:, 1] + boxes[:, 3] / 2], dim=-1
         )
         rois = torch.cat(
-            [torch.arange(batch_size, device=boxes.device, dtype=boxes.dtype)[:, None],
+            [torch.arange(support_count, device=boxes.device, dtype=boxes.dtype)[:, None],
              xyxy * boxes.new_tensor([input_w, input_h, input_w, input_h])], dim=-1
         )
         roi = roi_align(
             support_map, rois, output_size=(3, 3),
             spatial_scale=(feature_w / input_w + feature_h / input_h) / 2, aligned=True,
         ).mean(dim=(-1, -2))
-        token = self.support_roi_encoder(roi) + self.prompt_encoder(boxes)
+        shot_tokens = self.support_roi_encoder(roi) + self.prompt_encoder(boxes)
+        token = shot_tokens.reshape(batch_size, shots, -1).mean(dim=1)
 
-        support_outputs = self._decode_with_prompt_token(support_features, support_positions, support_cross, token)
+        support_outputs = self._decode_with_prompt_token(
+            support_features, support_positions, support_cross, shot_tokens
+        )
         query_outputs = self._decode_with_prompt_token(query_features, query_positions, query_cross, token)
         return support_outputs, query_outputs
 
