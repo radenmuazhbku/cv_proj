@@ -158,6 +158,10 @@ class PromptableDetector(nn.Module):
         a spatially stitched mega-image. Support and query predictions share one
         backbone pass; each support output can supply an auxiliary support-image
         detection loss while the query output supplies the transfer loss.
+
+        TODO: In the paired-image trainer, compute support-image detection loss using
+        each support image's full GT set (including its prompted instance) alongside
+        the query-image transfer loss. Do not pass support coordinates as query GT.
         """
         return self.forward_multi_shot_support_query(
             support_images[:, None] if support_images.ndim == 4 else support_images,
@@ -168,7 +172,11 @@ class PromptableDetector(nn.Module):
     def forward_multi_shot_support_query(
         self, support_images: Tensor, support_boxes: Tensor, query_images: Tensor
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        """Batch all support shots and queries as separate images for one backbone pass."""
+        """Batch all support shots and queries as separate images for one backbone pass.
+
+        TODO: Pair the returned per-shot ``support_outputs`` with each support image's
+        full annotation set for auxiliary detection supervision in training.
+        """
         if support_images.ndim != 5 or query_images.ndim != 4:
             raise ValueError("Expected support_images [B,S,3,H,W] and query_images [B,3,H,W].")
         batch_size, shots, channels, height, width = support_images.shape
@@ -443,6 +451,11 @@ class PromptableDetector(nn.Module):
         corresponds to each prompt. For support/query mode, target_present is one
         concept-presence label per image; Hungarian assignment matches distinct
         decoder queries to every valid GT box and unmatched queries are background.
+
+        TODO: Batched support/query training should call this for support outputs with
+        full support-image annotations (including prompt boxes), as well as for query
+        outputs with query-image annotations. The same-image prompt-inclusion flag in
+        the current trainer does not implement that separate support-image loss.
         """
         logits = outputs["pred_logits"]
         pred_boxes = outputs["pred_boxes"]

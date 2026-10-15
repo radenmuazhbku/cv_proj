@@ -165,9 +165,14 @@ def run_train_sanity_eval(
     figure_dir: Path,
     step: int,
     plot_mode: str = "overlay",
-    max_predictions: int = 0,
+    extra_predictions: int = 0,
+    evaluate_prompt_box_iou: bool = True,
 ) -> dict[str, object]:
-    """Evaluate fixed training episodes and save GT/prediction diagnostic panels."""
+    """Evaluate fixed training episodes and save GT/prediction diagnostic panels.
+
+    When enabled, prompt-box IoU is reported separately from IoU against the
+    remaining query targets.
+    """
     subset = loader.dataset
     dataset = subset.dataset if isinstance(subset, Subset) else subset
     category_names = {
@@ -191,15 +196,20 @@ def run_train_sanity_eval(
                 best_iou = None
                 if target_count:
                     best_iou = float(torch.stack([_box_iou_cxcywh(prediction, target) for target in targets]).max())
+                prompt_iou = None
+                if evaluate_prompt_box_iou and target_count:
+                    prompt_iou = float(
+                        _box_iou_cxcywh(prediction, batch["support_boxes"][item_index])
+                    )
 
                 metadata = dataset.coco.loadImgs([query_id])[0]
                 image_path = dataset.image_dir / metadata["file_name"]
                 image = Image.open(image_path).convert("RGB")
                 width, height = image.size
-                prediction_count = (
-                    scores.shape[1]
-                    if max_predictions <= 0
-                    else min(max_predictions, scores.shape[1])
+                prompt_target_count = int(target_count > 0)
+                red_prediction_count = target_count + prompt_target_count
+                prediction_count = min(
+                    scores.shape[1], red_prediction_count + extra_predictions
                 )
                 plot_scores, plot_indices = scores[item_index].topk(prediction_count)
                 plot_predictions = [
@@ -224,6 +234,7 @@ def run_train_sanity_eval(
                     target_xyxy,
                     support_examples,
                     plot_mode=plot_mode,
+                    red_prediction_count=min(scores.shape[1], red_prediction_count),
                 )
                 sample_view = "overlay" if plot_mode == "overlay" else "support_query"
                 sample_path = sample_root / sample_view / safe_class / f"{Path(metadata['file_name']).stem}.png"
@@ -236,8 +247,12 @@ def run_train_sanity_eval(
                         "present": bool(target_count),
                         "score": float(score),
                         "best_iou": best_iou,
+                        "prompt_iou": prompt_iou,
                         "prediction_cxcywh": prediction.detach().cpu().tolist(),
                         "plotted_prediction_count": prediction_count,
+                        "plotted_red_prediction_count": min(red_prediction_count, prediction_count),
+                        "plotted_extra_prediction_count": max(0, prediction_count - red_prediction_count),
+                        "prompt_prediction_slots_included": bool(prompt_target_count),
                         "target_count": target_count,
                         "support_image_ids": [support_id for support_id, _, _, _ in support_examples],
                         "figure": str(sample_path),
@@ -247,6 +262,7 @@ def run_train_sanity_eval(
 
     positive_records = [record for record in records if record["present"]]
     negative_records = [record for record in records if not record["present"]]
+    prompt_iou_records = [record for record in records if record["prompt_iou"] is not None]
     return {
         "step": step,
         "sample_count": len(records),
@@ -256,6 +272,11 @@ def run_train_sanity_eval(
             sum(float(record["best_iou"]) for record in positive_records) / len(positive_records)
             if positive_records else None
         ),
+        "mean_prompt_iou": (
+            sum(float(record["prompt_iou"]) for record in prompt_iou_records) / len(prompt_iou_records)
+            if prompt_iou_records else None
+        ),
+        "prompt_box_iou_enabled": evaluate_prompt_box_iou,
         "mean_positive_score": (
             sum(float(record["score"]) for record in positive_records) / len(positive_records)
             if positive_records else None
@@ -408,7 +429,8 @@ def run_episode_eval(
     figure_dir: Path | None = None,
     max_figures_per_class: int = 10,
     plot_mode: str = "overlay",
-    max_predictions: int = 0,
+    extra_predictions: int = 0,
+    evaluate_prompt_box_iou: bool = True,
 ) -> dict[str, object]:
     model.eval()
     by_category: dict[int, dict[str, object]] = {}
@@ -422,7 +444,7 @@ def run_episode_eval(
             scores = outputs["pred_logits"].sigmoid()[..., 0]
             gt_present = batch["present"].flatten() > 0.5
             for index, category_id in enumerate(batch["category_ids"]):
-                bucket = by_category.setdefault(category_id, {"examples": 0, "positive": 0, "negative": 0, "positive_score": 0.0, "negative_score": 0.0, "matched_iou": 0.0, "ground_truth_objects": 0, "presence_true_positive_at_0_5": 0, "presence_false_positive_at_0_5": 0, "recall50": 0, "recall75": 0})
+                bucket = by_category.setdefault(category_id, {"examples": 0, "positive": 0, "negative": 0, "positive_score": 0.0, "negative_score": 0.0, "matched_iou": 0.0, "prompt_iou": 0.0, "prompt_iou_count": 0, "ground_truth_objects": 0, "presence_true_positive_at_0_5": 0, "presence_false_positive_at_0_5": 0, "recall50": 0, "recall75": 0})
                 bucket["examples"] = int(bucket["examples"]) + 1
                 score = float(scores[index].max())
                 if bool(gt_present[index]):
@@ -433,6 +455,12 @@ def run_episode_eval(
                     best_target = int(ious.argmax())
                     gt_box = gt_boxes[best_target]
                     iou = float(ious[best_target])
+                    if evaluate_prompt_box_iou:
+                        prompt_iou = _box_iou_cxcywh(
+                            pred_box, batch["support_boxes"][index]
+                        )
+                        bucket["prompt_iou"] = float(bucket["prompt_iou"]) + float(prompt_iou)
+                        bucket["prompt_iou_count"] = int(bucket["prompt_iou_count"]) + 1
                     bucket["positive"] = int(bucket["positive"]) + 1
                     bucket["positive_score"] = float(bucket["positive_score"]) + score
                     bucket["matched_iou"] = float(bucket["matched_iou"]) + iou
@@ -447,10 +475,10 @@ def run_episode_eval(
                         gt_boxes_xyxy = [
                             _cxcywh_pixels(box, width, height) for box in gt_boxes
                         ]
-                        prediction_count = (
-                            scores.shape[1]
-                            if max_predictions <= 0
-                            else min(max_predictions, scores.shape[1])
+                        prompt_target_count = int(target_count > 0)
+                        red_prediction_count = target_count + prompt_target_count
+                        prediction_count = min(
+                            scores.shape[1], red_prediction_count + extra_predictions
                         )
                         plot_scores, plot_indices = scores[index].topk(prediction_count)
                         plot_predictions = [
@@ -465,6 +493,7 @@ def run_episode_eval(
                             plot_predictions, plot_scores.detach().cpu().tolist(),
                             gt_boxes_xyxy, support_examples,
                             plot_mode=plot_mode,
+                            red_prediction_count=min(scores.shape[1], red_prediction_count),
                         )
                         figure_counts[category_id] = figure_counts.get(category_id, 0) + 1
                 else:
@@ -478,12 +507,28 @@ def run_episode_eval(
         bucket["mean_positive_score"] = float(bucket["positive_score"]) / max(1, positives)
         bucket["mean_negative_score"] = float(bucket["negative_score"]) / max(1, negatives)
         bucket["mean_matched_iou"] = float(bucket["matched_iou"]) / max(1, positives)
+        bucket["mean_prompt_iou"] = (
+            float(bucket["prompt_iou"]) / int(bucket["prompt_iou_count"])
+            if evaluate_prompt_box_iou and int(bucket["prompt_iou_count"]) else None
+        )
         bucket["recall50"] = int(bucket["recall50"]) / max(1, positives)
         bucket["recall75"] = int(bucket["recall75"]) / max(1, positives)
         bucket["presence_recall_at_0_5"] = int(bucket["presence_true_positive_at_0_5"]) / max(1, positives)
         bucket["presence_false_positive_rate_at_0_5"] = int(bucket["presence_false_positive_at_0_5"]) / max(1, negatives)
     all_iou = [float(values["mean_matched_iou"]) for values in by_category.values() if int(values["positive"]) > 0]
-    return {"categories": by_category, "macro_positive_iou": sum(all_iou) / max(1, len(all_iou))}
+    all_prompt_iou = [
+        float(values["mean_prompt_iou"])
+        for values in by_category.values()
+        if values["mean_prompt_iou"] is not None
+    ]
+    return {
+        "categories": by_category,
+        "macro_positive_iou": sum(all_iou) / max(1, len(all_iou)),
+        "macro_prompt_iou": (
+            sum(all_prompt_iou) / len(all_prompt_iou) if all_prompt_iou else None
+        ),
+        "prompt_box_iou_enabled": evaluate_prompt_box_iou,
+    }
 
 
 def run_coco_map_eval(
@@ -761,12 +806,18 @@ def _save_query_support_figure(
     prediction_scores: list[float],
     support_examples: list[tuple[int, Image.Image, list[float], str]],
     plot_mode: str = "overlay",
+    red_prediction_count: int | None = None,
 ) -> None:
     """Save query GT/prediction alongside the exact support images and prompt boxes."""
     if plot_mode not in {"split", "overlay"}:
         raise ValueError(f"Unknown inference plot mode: {plot_mode!r}")
+    if red_prediction_count is None:
+        red_prediction_count = len(target_boxes)
     if plot_mode == "overlay":
-        figure, axis = plt.subplots(figsize=(9, 7))
+        figure, (original_axis, axis) = plt.subplots(1, 2, figsize=(16, 7))
+        original_axis.imshow(query_image)
+        original_axis.set_title("Original query image")
+        original_axis.axis("off")
         axis.imshow(query_image)
         axis.set_title(f"Prompt, all query GT, {len(prediction_boxes)} predictions")
         axis.axis("off")
@@ -788,11 +839,11 @@ def _save_query_support_figure(
             axis.add_patch(patches.Rectangle(
                 (x0, y0), x1 - x0, y1 - y0,
                 fill=False,
-                edgecolor="red" if index == 0 else "orange",
-                linewidth=2 if index == 0 else 1,
-                alpha=1.0 if index == 0 else 0.55,
-                label=f"top prediction {score:.2f}" if index == 0 else (
-                    "other predictions" if index == 1 else None
+                edgecolor="red" if index < red_prediction_count else "#b87333",
+                linewidth=2 if index < red_prediction_count else 0.8,
+                alpha=1.0 if index < red_prediction_count else 0.3,
+                label=("top predictions" if index == 0 else None) if index < red_prediction_count else (
+                    "extra predictions" if index == red_prediction_count else None
                 ),
             ))
         axis.legend(loc="upper right")
@@ -807,10 +858,11 @@ def _save_query_support_figure(
     outer_grid = figure.add_gridspec(2, 1, height_ratios=(2.0, 1.25), hspace=0.18)
     query_grid = outer_grid[0].subgridspec(1, 4, wspace=0.04)
     query_axes = [figure.add_subplot(query_grid[0, index]) for index in range(4)]
-    top_score = prediction_scores[0]
+    top_score = prediction_scores[0] if prediction_scores else None
     titles = (
         "Query image", "Query ground truth",
-        f"Top {len(prediction_boxes)} predictions (best {top_score:.3f})", "GT + predictions",
+        f"Top {len(prediction_boxes)} predictions" + (f" (best {top_score:.3f})" if top_score is not None else ""),
+        "GT + predictions",
     )
     for axis, title in zip(query_axes, titles, strict=True):
         axis.imshow(query_image)
@@ -825,21 +877,22 @@ def _save_query_support_figure(
         )
     for index, (box, score) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
         x0, y0, x1, y1 = box
-        color = "red" if index == 0 else "orange"
-        linewidth = 2 if index == 0 else 1
-        alpha = 1.0 if index == 0 else 0.55
+        is_target_count_prediction = index < red_prediction_count
+        color = "red" if is_target_count_prediction else "#b87333"
+        linewidth = 2 if is_target_count_prediction else 0.8
+        alpha = 1.0 if is_target_count_prediction else 0.3
         query_axes[2].add_patch(patches.Rectangle(
             (x0, y0), x1 - x0, y1 - y0,
             fill=False, edgecolor=color, linewidth=linewidth, alpha=alpha,
-            label=f"top prediction {score:.2f}" if index == 0 else (
-                "other predictions" if index == 1 else None
+            label=("top predictions" if index == 0 else None) if is_target_count_prediction else (
+                "extra predictions" if index == red_prediction_count else None
             ),
         ))
         query_axes[3].add_patch(patches.Rectangle(
             (x0, y0), x1 - x0, y1 - y0,
             fill=False, edgecolor=color, linewidth=linewidth, alpha=alpha,
-            label=f"top prediction {score:.2f}" if index == 0 else (
-                "other predictions" if index == 1 else None
+            label=("top predictions" if index == 0 else None) if is_target_count_prediction else (
+                "extra predictions" if index == red_prediction_count else None
             ),
         ))
     query_axes[2].legend(loc="upper right")
@@ -875,6 +928,7 @@ def _save_episode_figures(
     target_boxes: list[list[float]],
     support_examples: list[tuple[int, Image.Image, list[float], str]],
     plot_mode: str = "overlay",
+    red_prediction_count: int | None = None,
 ) -> None:
     safe_name, stem = class_name.replace(" ", "_"), Path(filename).stem
     if plot_mode == "overlay":
@@ -889,11 +943,17 @@ def _save_episode_figures(
             prediction_scores,
             support_examples,
             plot_mode="overlay",
+            red_prediction_count=red_prediction_count,
         )
         return
     if plot_mode != "split":
         raise ValueError(f"Unknown inference plot mode: {plot_mode!r}")
 
+    red_count = (
+        len(target_boxes)
+        if red_prediction_count is None
+        else min(len(prediction_boxes), red_prediction_count)
+    )
     view_dirs = {
         name: figure_dir / name / safe_name
         for name in ("original", "prediction", "prediction_gt")
@@ -906,10 +966,11 @@ def _save_episode_figures(
     for index, (prediction, score) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
         axis.add_patch(patches.Rectangle(
             (prediction[0], prediction[1]), prediction[2] - prediction[0], prediction[3] - prediction[1],
-            fill=False, edgecolor="red" if index == 0 else "orange",
-            linewidth=2 if index == 0 else 1, alpha=1.0 if index == 0 else 0.55,
-            label=f"top prediction {score:.2f}" if index == 0 else (
-                "other predictions" if index == 1 else None
+            fill=False, edgecolor="red" if index < red_count else "#b87333",
+            linewidth=2 if index < red_count else 0.8,
+            alpha=1.0 if index < red_count else 0.3,
+            label=("top predictions" if index == 0 else None) if index < red_count else (
+                "extra predictions" if index == red_count else None
             ),
         ))
     axis.axis("off")
@@ -927,10 +988,11 @@ def _save_episode_figures(
     for index, (prediction, score) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
         axis.add_patch(patches.Rectangle(
             (prediction[0], prediction[1]), prediction[2] - prediction[0], prediction[3] - prediction[1],
-            fill=False, edgecolor="red" if index == 0 else "orange",
-            linewidth=2 if index == 0 else 1, alpha=1.0 if index == 0 else 0.55,
-            label=f"top prediction {score:.2f}" if index == 0 else (
-                "other predictions" if index == 1 else None
+            fill=False, edgecolor="red" if index < red_count else "#b87333",
+            linewidth=2 if index < red_count else 0.8,
+            alpha=1.0 if index < red_count else 0.3,
+            label=("top predictions" if index == 0 else None) if index < red_count else (
+                "extra predictions" if index == red_count else None
             ),
         ))
     axis.axis("off")
@@ -948,6 +1010,7 @@ def _save_episode_figures(
         prediction_scores,
         support_examples,
         plot_mode="split",
+        red_prediction_count=red_prediction_count,
     )
 
 
@@ -993,6 +1056,14 @@ def main() -> None:
     parser.add_argument("--train-sanity-samples", type=_parse_train_sanity_samples, default=8,
                         help="Train batches per evaluation (integer), or a fraction/percent of the train loader (e.g. 0.02 or 2%%).")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--include-prompt-box-in-loss", action=argparse.BooleanOptionalAction, default=True,
+        help="Also train query detection against the prompted instance box (default: enabled).",
+    )
+    parser.add_argument(
+        "--evaluate-prompt-box-iou", action=argparse.BooleanOptionalAction, default=True,
+        help="Report IoU of the top prediction against the prompted box separately (default: enabled).",
+    )
     parser.add_argument("--coco-eval-batch-size", type=int, default=8)
     parser.add_argument("--num-queries", type=int, default=100)
     parser.add_argument("--resolution", type=int, default=560)
@@ -1013,8 +1084,8 @@ def main() -> None:
         help="overlay: one image with prompt, all query GT, and predictions (default); split: save separate views in folders.",
     )
     parser.add_argument(
-        "--inference-max-predictions", type=int, default=0,
-        help="Maximum scored boxes to draw; 0 draws every decoder query (default).",
+        "--inference-extra-predictions", type=int, default=0,
+        help="Draw this many extra low-ranked predictions beyond the query GT count (default: 0).",
     )
     parser.add_argument("--selection-metric", choices=("episodic_iou",), default="episodic_iou")
     parser.add_argument("--coco-selection-images", type=int, default=500)
@@ -1027,8 +1098,8 @@ def main() -> None:
         parser.error("--steps must be at least 2 for a learning-rate schedule")
     if args.batch_repeat <= 0:
         parser.error("--batch-repeat must be positive")
-    if args.inference_max_predictions < 0:
-        parser.error("--inference-max-predictions must be non-negative")
+    if args.inference_extra_predictions < 0:
+        parser.error("--inference-extra-predictions must be non-negative")
     if args.max_eval_checkpoints <= 0:
         parser.error("--max-eval-checkpoints must be positive")
     if not 0.0 <= args.warmup_start_factor <= 1.0:
@@ -1137,6 +1208,7 @@ def main() -> None:
         f"batch repeat={args.batch_repeat}: each sampled batch gets up to "
         f"{args.batch_repeat} optimizer updates before the next batch"
     )
+    print(f"include prompt box in query detection loss={args.include_prompt_box_in_loss}")
     current_batch = None
     for step in progress:
         lr = _scheduled_lr(
@@ -1153,11 +1225,25 @@ def main() -> None:
                 current_batch = _move_batch(next(iterator), device)
         batch = current_batch
         outputs = model.forward_same_image(batch["query_images"], batch["support_boxes"])
+        loss_target_boxes = batch["query_boxes"]
+        loss_target_mask = batch["query_target_mask"]
+        if args.include_prompt_box_in_loss:
+            # Same-image mode: add the prompt instance to this image's query targets.
+            # TODO: For batched support/query mode, add separate support-image losses
+            # from support_outputs and full support annotations; this switch alone
+            # must not add a support box as a target on a different query image.
+            prompt_is_present = batch["present"].flatten() > 0.5
+            loss_target_boxes = torch.cat(
+                [loss_target_boxes, batch["support_boxes"][:, None, :]], dim=1
+            )
+            loss_target_mask = torch.cat(
+                [loss_target_mask, prompt_is_present[:, None]], dim=1
+            )
         losses = model.loss(
             outputs,
-            batch["query_boxes"],
+            loss_target_boxes,
             batch["present"],
-            target_mask=batch["query_target_mask"],
+            target_mask=loss_target_mask,
         )
         loss = losses["loss_objectness"] + 5 * losses["loss_bbox"] + 2 * losses["loss_giou"]
         scalar_stats = torch.stack(
@@ -1168,7 +1254,7 @@ def main() -> None:
                 losses["positive_score"], losses["negative_score"],
             ]
         )
-        target_boxes = batch["query_boxes"][batch["query_target_mask"]]
+        target_boxes = loss_target_boxes[loss_target_mask]
         target_box_mean = target_boxes.mean(dim=0) if target_boxes.numel() else torch.zeros(4, device=device)
         cpu_stats = torch.cat((scalar_stats, losses["pred_box_mean"], target_box_mean)).cpu().tolist()
         stat_names = (
@@ -1216,7 +1302,10 @@ def main() -> None:
             interval_values = {name: 0.0 for name in interval_values}
             interval_steps = 0
         if (step + 1) % args.eval_every == 0:
-            val_result = run_episode_eval(model, val_loader, device)
+            val_result = run_episode_eval(
+                model, val_loader, device,
+                evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
+            )
             metrics[f"validation_step_{step + 1}"] = {
                 "episodic": val_result,
                 "selection_note": "same-image prompted recall uses the episodic IoU metric",
@@ -1229,7 +1318,8 @@ def main() -> None:
                     args.figure_dir / "train_sanity" / f"step_{step + 1:06d}",
                     step + 1,
                     plot_mode=args.inference_plot_mode,
-                    max_predictions=args.inference_max_predictions,
+                    extra_predictions=args.inference_extra_predictions,
+                    evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
                 )
                 metrics[f"train_sanity_step_{step + 1}"] = sanity_result
                 with train_sanity_log_path.open("a", encoding="utf-8") as log_file:
@@ -1238,6 +1328,7 @@ def main() -> None:
                 print(
                     f"train sanity step={step + 1} samples={sanity_result['sample_count']} "
                     f"positive_iou={sanity_result['mean_positive_iou']} "
+                    f"prompt_iou={sanity_result['mean_prompt_iou']} "
                     f"positive_score={sanity_result['mean_positive_score']} "
                     f"negative_score={sanity_result['mean_negative_score']} "
                     f"plots={args.figure_dir / 'train_sanity' / f'step_{step + 1:06d}'}"
@@ -1285,17 +1376,23 @@ def main() -> None:
         metrics["selected_checkpoint"] = str(best_path)
     else:
         metrics["selected_checkpoint"] = str(args.output)
-    metrics["seen_validation_final"] = run_episode_eval(model, val_loader, device)
+    metrics["seen_validation_final"] = run_episode_eval(
+        model, val_loader, device,
+        evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
+    )
     metrics["held_out_test"] = run_episode_eval(
         model, test_loader, device, figure_dir=args.figure_dir / "heldout_test",
         max_figures_per_class=args.max_figures_per_class,
         plot_mode=args.inference_plot_mode,
-        max_predictions=args.inference_max_predictions,
+        extra_predictions=args.inference_extra_predictions,
+        evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
     )
     metrics["metric_protocol"] = (
         "same-image visual prompting; one instance box is the prompt and the remaining "
         "same-class instances in that image are targets"
     )
+    metrics["include_prompt_box_in_loss"] = args.include_prompt_box_in_loss
+    metrics["evaluate_prompt_box_iou"] = args.evaluate_prompt_box_iou
     metrics_path = args.output.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps(metrics, indent=2, default=str))
     print(f"checkpoint={args.output} metrics={metrics_path}")

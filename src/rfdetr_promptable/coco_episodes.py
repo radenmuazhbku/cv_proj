@@ -179,7 +179,12 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
 
 
 def collate_few_shot(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Flatten variable-shot support sets and retain query-to-concept assignments."""
+    """Collate query targets and the current single prompt per episode.
+
+    TODO: Preserve every support image/box and its full annotation set when the
+    dataset is extended to multi-shot episodes; this collator currently takes only
+    ``support_boxes[0]`` and builds targets from the remaining same-image instances.
+    """
     max_targets = max(item["target_boxes"].shape[0] for item in batch)
     query_eval_boxes = torch.zeros((len(batch), max_targets, 4), dtype=torch.float32)
     query_eval_counts = torch.zeros(len(batch), dtype=torch.long)
