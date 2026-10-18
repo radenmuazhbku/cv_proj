@@ -1,4 +1,4 @@
-"""Evaluate a trained support/query checkpoint with COCO bbox AP/AR."""
+"""Evaluate a trained same-image prompted checkpoint with COCO bbox AP/AR."""
 
 from __future__ import annotations
 
@@ -17,13 +17,14 @@ from train_promptable_fewshot import run_coco_map_eval
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--query-image-dir", type=Path, required=True)
-    parser.add_argument("--query-annotation-file", type=Path, required=True)
-    parser.add_argument("--support-image-dir", type=Path)
-    parser.add_argument("--support-annotation-file", type=Path, required=True)
-    parser.add_argument("--max-shots", type=int, default=5)
+    parser.add_argument("--image-dir", type=Path, required=True)
+    parser.add_argument("--annotation-file", type=Path, required=True)
     parser.add_argument("--query-batch-size", type=int, default=8)
     parser.add_argument("--max-query-images", type=int)
+    parser.add_argument(
+        "--include-prompt-box-as-target", action=argparse.BooleanOptionalAction, default=True,
+        help="Include each prompt instance in the COCO GT targets (default: enabled).",
+    )
     parser.add_argument("--num-queries", type=int, default=100)
     parser.add_argument("--resolution", type=int, default=560)
     parser.add_argument("--seed", type=int, default=7)
@@ -31,15 +32,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("logs/promptable_coco_metrics.json"))
     args = parser.parse_args()
 
-    support_image_dir = args.support_image_dir or args.query_image_dir
     dataset = CocoFewShotEpisodeDataset(
-        args.query_image_dir,
-        args.query_annotation_file,
-        support_image_dir=support_image_dir,
+        args.image_dir,
+        args.annotation_file,
         resolution=args.resolution,
-        max_shots=args.max_shots,
+        max_shots=1,
         negative_eval_per_class=0,
-        support_annotation_file=args.support_annotation_file,
         training=False,
         seed=args.seed,
     )
@@ -59,15 +57,14 @@ def main() -> None:
         model,
         dataset,
         torch.device(args.device),
-        args.max_shots,
         args.query_batch_size,
         args.seed,
         max_query_images=args.max_query_images,
+        include_prompt_box_as_target=args.include_prompt_box_as_target,
     )
     payload = {
         "checkpoint": str(args.checkpoint),
-        "query_annotation_file": str(args.query_annotation_file),
-        "support_annotation_file": str(args.support_annotation_file),
+        "annotation_file": str(args.annotation_file),
         "metrics": result,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

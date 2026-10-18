@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import math
 import random
@@ -121,13 +123,13 @@ def _scheduled_lr(base_lr: float, step: int, total_steps: int, warmup_steps: int
     return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
 
-def _build_train_sanity_loader(
+def _build_fixed_diagnostic_loader(
     dataset: CocoFewShotEpisodeDataset,
     batch_size: int,
     sample_budget: int | float,
     seed: int,
 ) -> DataLoader:
-    """Build one deterministic, reusable train subset and ensure it contains a positive episode."""
+    """Build one deterministic, reusable diagnostic subset with a positive episode."""
     total_batches = math.ceil(len(dataset) / batch_size)
     batch_count = (
         min(int(sample_budget), total_batches)
@@ -535,234 +537,210 @@ def run_coco_map_eval(
     model: PromptableDetector,
     dataset: CocoFewShotEpisodeDataset,
     device: torch.device,
-    max_shots: int,
     query_batch_size: int,
     seed: int,
     max_query_images: int | None = None,
+    include_prompt_box_as_target: bool = True,
 ) -> dict[str, object]:
-    """Evaluate class-conditioned detections with standard COCO AP/AR metrics.
+    """Compute COCO AP/AR over same-image prompted episodes.
 
-    A deterministic support set is selected for each category. Its image IDs are
-    excluded from that category's query set to prevent image-level leakage. The
-    query set otherwise contains every COCO image, including images with no
-    instances of the evaluated category.
+    Each episode uses its own query image and one annotated instance from that
+    image as the prompt. By default the prompt annotation is included alongside
+    the other same-class instances in the COCO ground truth.
     """
     if query_batch_size <= 0:
         raise ValueError("query_batch_size must be positive")
     if max_query_images is not None and max_query_images <= 0:
         raise ValueError("max_query_images must be positive when specified")
-    coco_gt = dataset.coco
-    all_image_ids = sorted(coco_gt.getImgIds())
-    categories = sorted(coco_gt.getCatIds())
-    category_names = {
-        item["id"]: item["name"] for item in coco_gt.loadCats(categories)
-    }
-    category_metrics: dict[int, dict[str, object]] = {}
-    support_ids_by_category: dict[int, list[int]] = {}
-    for category_id in categories:
-        support_image_index = (
-            dataset.support_category_images
-            if dataset.has_separate_support
-            else dataset.category_images
-        )
-        positive_image_ids = sorted(support_image_index.get(category_id, []))
-        minimum_support = 1 if dataset.has_separate_support else 2
-        if len(positive_image_ids) < minimum_support:
-            continue
-        available_shots = len(positive_image_ids) if dataset.has_separate_support else len(positive_image_ids) - 1
-        support_count = min(max_shots, available_shots)
-        support_ids_by_category[category_id] = sorted(
-            positive_image_ids,
-            key=lambda image_id: (seed * 1_000_003 + image_id) % 2**32,
-        )[:support_count]
-    excluded_support_ids = {
-        image_id
-        for category_support_ids in support_ids_by_category.values()
-        for image_id in category_support_ids
-    }
-    query_ids = (
-        all_image_ids
-        if dataset.has_separate_support
-        else [image_id for image_id in all_image_ids if image_id not in excluded_support_ids]
+    from pycocotools.coco import COCO
+    from torch.utils.data import Subset
+
+    image_ids = sorted({image_id for _, image_id, _ in dataset.eval_records})
+    if max_query_images is not None and len(image_ids) > max_query_images:
+        image_ids = sorted(
+            image_ids,
+            key=lambda image_id: ((seed * 1_000_003 + image_id) % 2**32, image_id),
+        )[:max_query_images]
+        image_ids = sorted(image_ids)
+    selected_image_ids = set(image_ids)
+    selected_indices = [
+        index for index, (_, image_id, _) in enumerate(dataset.eval_records)
+        if image_id in selected_image_ids
+    ]
+    if not selected_indices:
+        return {
+            "mAP": None, "mAP50": None, "mAP75": None, "mAR100": None,
+            "query_images": 0, "query_image_category_pairs": 0,
+            "prompt_box_included_as_target": include_prompt_box_as_target,
+            "evaluation_protocol": "same-image prompt; promptable validation episodes only",
+        }
+
+    loader = DataLoader(
+        Subset(dataset, selected_indices),
+        batch_size=query_batch_size,
+        shuffle=False,
+        collate_fn=collate_few_shot,
+        num_workers=0,
+        pin_memory=True,
     )
-    if max_query_images is not None and len(query_ids) > max_query_images:
-        query_set = set(query_ids)
-        selected: set[int] = set()
-        per_category_quota = max(1, max_query_images // (2 * max(1, len(categories))))
-        for category_id in categories:
-            candidates = [
-                image_id for image_id in dataset.category_images.get(category_id, [])
-                if image_id in query_set
-            ]
-            selected.update(candidates[:per_category_quota])
-        ordered_ids = [image_id for image_id in query_ids if image_id in selected]
-        if len(ordered_ids) < max_query_images:
-            ordered_ids.extend(
-                image_id for image_id in query_ids
-                if image_id not in selected
-            )
-        query_ids = ordered_ids[:max_query_images]
+    source_coco = dataset.coco
+    image_metadata = {
+        int(image_id): dict(source_coco.loadImgs([int(image_id)])[0])
+        for image_id in image_ids
+    }
+    categories = source_coco.loadCats(source_coco.getCatIds())
+    gt_annotations: list[dict[str, object]] = []
+    predictions: list[dict[str, object]] = []
+    used_categories: set[int] = set()
+    category_episode_counts: dict[int, int] = {}
+    next_annotation_id = 1
     evaluation_started = time.perf_counter()
     model_was_training = model.training
     model.eval()
-
     with torch.inference_mode():
-        for category_id in categories:
-            support_ids = support_ids_by_category.get(category_id)
-            if not support_ids:
-                continue
-            support_count = len(support_ids)
-            support_images: list[torch.Tensor] = []
-            support_boxes: list[torch.Tensor] = []
-            for support_id in support_ids:
-                support_annotations = (
-                    dataset.support_image_annotations
-                    if dataset.has_separate_support
-                    else dataset.image_annotations
-                )
-                annotations = [
-                    ann for ann in support_annotations[support_id]
-                    if ann["category_id"] == category_id
-                ]
-                annotation = min(annotations, key=lambda ann: ann["id"])
-                support_tensor, width, height = dataset._load_tensor(
-                    support_id, support=dataset.has_separate_support
-                )
-                support_images.append(support_tensor)
-                support_boxes.append(
-                    dataset._normalize_box(annotation["bbox"], width, height)
-                )
+        for batch in tqdm(loader, desc="same-image COCO eval", leave=False):
+            batch = _move_batch(batch, device)
+            outputs = model.forward_same_image(batch["query_images"], batch["support_boxes"])
+            scores = outputs["pred_logits"].sigmoid()[..., 0]
+            predicted_boxes = outputs["pred_boxes"]
+            for index, category_id in enumerate(batch["category_ids"]):
+                category_id = int(category_id)
+                image_id = int(batch["query_image_ids"][index])
+                metadata = image_metadata[image_id]
+                width, height = int(metadata["width"]), int(metadata["height"])
+                used_categories.add(category_id)
+                category_episode_counts[category_id] = category_episode_counts.get(category_id, 0) + 1
+                target_count = int(batch["query_eval_counts"][index])
+                gt_boxes = batch["query_eval_boxes"][index, :target_count]
+                if include_prompt_box_as_target:
+                    gt_boxes = torch.cat([gt_boxes, batch["support_boxes"][index:index + 1]], dim=0)
+                for box in gt_boxes:
+                    cx, cy, box_width, box_height = box.detach().float().cpu().tolist()
+                    x = max(0.0, (cx - box_width / 2) * width)
+                    y = max(0.0, (cy - box_height / 2) * height)
+                    right = min(float(width), (cx + box_width / 2) * width)
+                    bottom = min(float(height), (cy + box_height / 2) * height)
+                    if right <= x or bottom <= y:
+                        continue
+                    gt_annotations.append({
+                        "id": next_annotation_id,
+                        "image_id": image_id,
+                        "category_id": category_id,
+                        "bbox": [x, y, right - x, bottom - y],
+                        "area": (right - x) * (bottom - y),
+                        "iscrowd": 0,
+                    })
+                    next_annotation_id += 1
 
-            category_results: list[dict[str, float | int]] = []
-            group_ids = torch.full((support_count,), category_id, dtype=torch.long, device=device)
-            support_images_tensor = torch.stack(support_images).to(device)
-            support_boxes_tensor = torch.stack(support_boxes).to(device)
-            encoded_support = model.encode_support(
-                support_images_tensor, support_boxes_tensor, support_group_ids=group_ids
-            )
-            for start in range(0, len(query_ids), query_batch_size):
-                batch_ids = query_ids[start : start + query_batch_size]
-                query_tensors: list[torch.Tensor] = []
-                query_sizes: list[tuple[int, int]] = []
-                for image_id in batch_ids:
-                    query_tensor, width, height = dataset._load_tensor(image_id)
-                    query_tensors.append(query_tensor)
-                    query_sizes.append((width, height))
-                query_count = len(batch_ids)
-                outputs = model.forward_support_query(
-                    support_images_tensor,
-                    support_boxes_tensor,
-                    torch.stack(query_tensors).to(device),
-                    support_group_ids=group_ids,
-                    query_to_support=torch.full(
-                        (query_count,), category_id, dtype=torch.long, device=device
-                    ),
-                    encoded_support=encoded_support,
-                )
-                scores = outputs["pred_logits"].sigmoid()[..., 0]
-                boxes = box_cxcywh_to_xyxy(outputs["pred_boxes"])
-                for batch_index, (image_id, (width, height)) in enumerate(
-                    zip(batch_ids, query_sizes, strict=True)
-                ):
-                    image_boxes = boxes[batch_index].clamp(0, 1)
-                    image_boxes[:, 0::2] *= width
-                    image_boxes[:, 1::2] *= height
-                    image_scores = scores[batch_index]
-                    keep = torch.isfinite(image_scores) & torch.isfinite(image_boxes).all(dim=1)
-                    image_boxes = image_boxes[keep].cpu()
-                    image_scores = image_scores[keep].cpu()
-                    if image_scores.numel() > 100:
-                        image_scores, top_indices = image_scores.topk(100)
-                        image_boxes = image_boxes[top_indices]
-                    for box, score in zip(image_boxes.tolist(), image_scores.tolist(), strict=True):
-                        x0, y0, x1, y1 = box
-                        if x1 <= x0 or y1 <= y0:
-                            continue
-                        category_results.append(
-                            {
-                                "image_id": image_id,
-                                "category_id": category_id,
-                                "bbox": [x0, y0, x1 - x0, y1 - y0],
-                                "score": score,
-                            }
-                        )
-
-            if not category_results:
-                category_metrics[category_id] = {
-                    "name": category_names[category_id],
-                    "support_images": support_count,
-                    "support_image_ids": support_ids,
-                    "query_images": len(query_ids),
-                    "AP": 0.0,
-                    "AP50": 0.0,
-                    "AP75": 0.0,
-                    "AP_small": 0.0,
-                    "AP_medium": 0.0,
-                    "AP_large": 0.0,
-                    "AR1": 0.0,
-                    "AR10": 0.0,
-                    "AR100": 0.0,
-                }
-                continue
-            coco_dt = coco_gt.loadRes(category_results)
-            evaluator = COCOeval(coco_gt, coco_dt, "bbox")
-            evaluator.params.imgIds = query_ids
-            evaluator.params.catIds = [category_id]
-            evaluator.params.maxDets = [1, 10, 100]
-            evaluator.evaluate()
-            evaluator.accumulate()
-            evaluator.summarize()
-            category_metrics[category_id] = {
-                "name": category_names[category_id],
-                "support_images": support_count,
-                "support_image_ids": support_ids,
-                "query_images": len(query_ids),
-                "AP": float(evaluator.stats[0]),
-                "AP50": float(evaluator.stats[1]),
-                "AP75": float(evaluator.stats[2]),
-                "AP_small": float(evaluator.stats[3]),
-                "AP_medium": float(evaluator.stats[4]),
-                "AP_large": float(evaluator.stats[5]),
-                "AR1": float(evaluator.stats[6]),
-                "AR10": float(evaluator.stats[7]),
-                "AR100": float(evaluator.stats[8]),
-            }
+                boxes_xyxy = box_cxcywh_to_xyxy(predicted_boxes[index]).clamp(0, 1)
+                boxes_xyxy[:, 0::2] *= width
+                boxes_xyxy[:, 1::2] *= height
+                image_scores = scores[index]
+                keep = torch.isfinite(image_scores) & torch.isfinite(boxes_xyxy).all(dim=1)
+                kept_scores = image_scores[keep]
+                kept_boxes = boxes_xyxy[keep]
+                if kept_scores.numel() > 100:
+                    kept_scores, top_indices = kept_scores.topk(100)
+                    kept_boxes = kept_boxes[top_indices]
+                for box, score in zip(kept_boxes.cpu().tolist(), kept_scores.cpu().tolist(), strict=True):
+                    x0, y0, x1, y1 = box
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    predictions.append({
+                        "image_id": image_id,
+                        "category_id": category_id,
+                        "bbox": [x0, y0, x1 - x0, y1 - y0],
+                        "score": float(score),
+                    })
 
     if model_was_training:
         model.train()
     elapsed_seconds = time.perf_counter() - evaluation_started
-    def macro(metric_name: str) -> float:
-        values = [
-            float(value[metric_name])
-            for value in category_metrics.values()
-            if float(value[metric_name]) >= 0
-        ]
-        return sum(values) / max(1, len(values))
+    if not gt_annotations or not predictions:
+        return {
+            "mAP": None, "mAP50": None, "mAP75": None, "mAR100": None,
+            "query_images": len(image_ids),
+            "query_image_category_pairs": len(selected_indices),
+            "prompt_box_included_as_target": include_prompt_box_as_target,
+            "elapsed_seconds": elapsed_seconds,
+            "evaluation_protocol": "same-image prompt; promptable validation episodes only",
+        }
+
+    coco_gt = COCO()
+    coco_gt.dataset = {
+        "info": {},
+        "licenses": [],
+        "images": [image_metadata[image_id] for image_id in image_ids],
+        "categories": [category for category in categories if int(category["id"]) in used_categories],
+        "annotations": gt_annotations,
+    }
+    coco_gt.createIndex()
+    coco_dt = coco_gt.loadRes(predictions)
+    evaluator = COCOeval(coco_gt, coco_dt, "bbox")
+    evaluator.params.imgIds = image_ids
+    evaluator.params.catIds = sorted(used_categories)
+    evaluator.params.maxDets = [1, 10, 100]
+    evaluator.evaluate()
+    evaluator.accumulate()
+    with contextlib.redirect_stdout(io.StringIO()):
+        evaluator.summarize()
+
+    precision = evaluator.eval["precision"]
+    recall = evaluator.eval["recall"]
+    iou_thresholds = evaluator.params.iouThrs
+
+    def mean_valid(values: np.ndarray) -> float:
+        valid = values[values > -1]
+        return float(valid.mean()) if valid.size else -1.0
+
+    category_metrics: dict[int, dict[str, object]] = {}
+    for category_index, category_id in enumerate(sorted(used_categories)):
+        category_precision = precision[:, :, category_index, :, :]
+        category_recall = recall[:, category_index, :, :]
+        iou50_index = int(np.argmin(np.abs(iou_thresholds - 0.50)))
+        iou75_index = int(np.argmin(np.abs(iou_thresholds - 0.75)))
+        category_gt_count = sum(
+            int(annotation["category_id"]) == category_id for annotation in gt_annotations
+        )
+        category_metrics[category_id] = {
+            "name": next(
+                str(category["name"])
+                for category in categories
+                if int(category["id"]) == category_id
+            ),
+            "episodes": category_episode_counts[category_id],
+            "ground_truth_objects": category_gt_count,
+            "AP": mean_valid(category_precision[:, :, 0, -1]),
+            "AP50": mean_valid(category_precision[iou50_index, :, 0, -1]),
+            "AP75": mean_valid(category_precision[iou75_index, :, 0, -1]),
+            "AP_small": mean_valid(category_precision[:, :, 1, -1]),
+            "AP_medium": mean_valid(category_precision[:, :, 2, -1]),
+            "AP_large": mean_valid(category_precision[:, :, 3, -1]),
+            "AR1": mean_valid(category_recall[:, 0, 0]),
+            "AR10": mean_valid(category_recall[:, 0, 1]),
+            "AR100": mean_valid(category_recall[:, 0, 2]),
+        }
 
     return {
         "categories": category_metrics,
-        "mAP": macro("AP"),
-        "mAP50": macro("AP50"),
-        "mAP75": macro("AP75"),
-        "mAP_small": macro("AP_small"),
-        "mAP_medium": macro("AP_medium"),
-        "mAP_large": macro("AP_large"),
-        "mAR1": macro("AR1"),
-        "mAR10": macro("AR10"),
-        "mAR100": macro("AR100"),
+        "mAP": float(evaluator.stats[0]),
+        "mAP50": float(evaluator.stats[1]),
+        "mAP75": float(evaluator.stats[2]),
+        "mAP_small": float(evaluator.stats[3]),
+        "mAP_medium": float(evaluator.stats[4]),
+        "mAP_large": float(evaluator.stats[5]),
+        "mAR1": float(evaluator.stats[6]),
+        "mAR10": float(evaluator.stats[7]),
+        "mAR100": float(evaluator.stats[8]),
         "metric_scale": "0_to_1",
-        "query_image_category_pairs": len(query_ids) * len(category_metrics),
+        "query_images": len(image_ids),
+        "query_image_category_pairs": len(selected_indices),
+        "prompt_box_included_as_target": include_prompt_box_as_target,
         "elapsed_seconds": elapsed_seconds,
         "query_pairs_per_second": (
-            len(query_ids) * len(category_metrics) / elapsed_seconds
-            if elapsed_seconds > 0
-            else 0.0
+            len(selected_indices) / elapsed_seconds if elapsed_seconds > 0 else 0.0
         ),
-        "evaluation_protocol": (
-            "COCOeval bbox; dedicated support images are disjoint from all query images"
-            if dataset.has_separate_support
-            else "COCOeval bbox; union of all category support images excluded from one common query-image set"
-        ),
+        "evaluation_protocol": "COCOeval bbox on same-image prompted episodes; image categories without valid prompt episodes are omitted",
     }
 
 
@@ -809,7 +787,7 @@ def _save_query_support_figure(
     red_prediction_count: int | None = None,
 ) -> None:
     """Save query GT/prediction alongside the exact support images and prompt boxes."""
-    if plot_mode not in {"split", "overlay"}:
+    if plot_mode not in {"split", "overlay", "compact"}:
         raise ValueError(f"Unknown inference plot mode: {plot_mode!r}")
     if red_prediction_count is None:
         red_prediction_count = len(target_boxes)
@@ -821,12 +799,17 @@ def _save_query_support_figure(
         axis.imshow(query_image)
         axis.set_title(f"Prompt, all query GT, {len(prediction_boxes)} predictions")
         axis.axis("off")
-        for index, (_, _, prompt_box, _) in enumerate(support_examples):
+        prompt_legend_labels: set[str] = set()
+        for _, _, prompt_box, prompt_name in support_examples:
             x0, y0, x1, y1 = prompt_box
+            is_negative_prompt = "negative" in prompt_name.lower()
+            prompt_legend_label = "negative prompt" if is_negative_prompt else "positive prompt"
+            legend_label = prompt_legend_label if prompt_legend_label not in prompt_legend_labels else None
+            prompt_legend_labels.add(prompt_legend_label)
             axis.add_patch(patches.Rectangle(
                 (x0, y0), x1 - x0, y1 - y0,
-                fill=False, edgecolor="cyan", linewidth=2,
-                label="prompt box" if index == 0 else None,
+                fill=False, edgecolor="#ff9f1c" if is_negative_prompt else "cyan", linewidth=2,
+                label=legend_label,
             ))
         for index, (x0, y0, x1, y1) in enumerate(target_boxes):
             axis.add_patch(patches.Rectangle(
@@ -849,6 +832,75 @@ def _save_query_support_figure(
         axis.legend(loc="upper right")
         figure.suptitle(summary)
         figure.tight_layout()
+        figure.savefig(output_path, dpi=120, bbox_inches="tight")
+        plt.close(figure)
+        return
+
+    if plot_mode == "compact":
+        support_count = len(support_examples)
+        figure = plt.figure(figsize=(13, 6.2 if support_count <= 2 else 7.2))
+        outer_grid = figure.add_gridspec(
+            3, 1, height_ratios=(2.0, 0.24, 1.0), hspace=0.22
+        )
+        query_grid = outer_grid[0].subgridspec(1, 2, wspace=0.04)
+        original_axis, overlay_axis = (
+            figure.add_subplot(query_grid[0, index]) for index in range(2)
+        )
+        original_axis.imshow(query_image)
+        original_axis.set_title("Query image")
+        original_axis.axis("off")
+        overlay_axis.imshow(query_image)
+        overlay_axis.set_title("Query GT + top predictions")
+        overlay_axis.axis("off")
+        for x0, y0, x1, y1 in target_boxes:
+            overlay_axis.add_patch(patches.Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                fill=False, edgecolor="lime", linewidth=1.8,
+            ))
+        for index, (box, _) in enumerate(zip(prediction_boxes, prediction_scores, strict=True)):
+            x0, y0, x1, y1 = box
+            overlay_axis.add_patch(patches.Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                fill=False,
+                edgecolor="red" if index < red_prediction_count else "#b87333",
+                linewidth=1.8 if index < red_prediction_count else 0.8,
+                alpha=1.0 if index < red_prediction_count else 0.3,
+            ))
+        legend_axis = figure.add_subplot(outer_grid[1])
+        legend_axis.axis("off")
+        legend_handles = [
+            patches.Patch(fill=False, edgecolor="lime", linewidth=1.8, label="query GT"),
+            patches.Patch(fill=False, edgecolor="red", linewidth=1.8, label="top predictions"),
+            patches.Patch(fill=False, edgecolor="cyan", linewidth=1.8, label="support prompt"),
+        ]
+        if any("negative" in label.lower() for _, _, _, label in support_examples):
+            legend_handles[-1] = patches.Patch(
+                fill=False, edgecolor="cyan", linewidth=1.8, label="positive prompt"
+            )
+            legend_handles.append(patches.Patch(
+                fill=False, edgecolor="#ff9f1c", linewidth=1.8, label="negative prompt"
+            ))
+        legend_axis.legend(
+            handles=legend_handles, loc="center", ncol=len(legend_handles), frameon=False,
+            fontsize=8,
+        )
+        if support_examples:
+            support_grid = outer_grid[2].subgridspec(1, support_count, wspace=0.06)
+            for index, (_, support_image, support_box, label) in enumerate(support_examples):
+                axis = figure.add_subplot(support_grid[0, index])
+                axis.imshow(support_image)
+                axis.set_title(label, fontsize=8, pad=1)
+                axis.axis("off")
+                x0, y0, x1, y1 = support_box
+                prompt_color = "#ff9f1c" if "negative" in label.lower() else "cyan"
+                axis.add_patch(patches.Rectangle(
+                    (x0, y0), x1 - x0, y1 - y0,
+                    fill=False, edgecolor=prompt_color, linewidth=1.8,
+                ))
+        else:
+            axis = figure.add_subplot(outer_grid[2])
+            axis.axis("off")
+        figure.suptitle(summary, y=0.99)
         figure.savefig(output_path, dpi=120, bbox_inches="tight")
         plt.close(figure)
         return
@@ -906,10 +958,11 @@ def _save_query_support_figure(
             axis.set_title(label, fontsize=9)
             axis.axis("off")
             x0, y0, x1, y1 = support_box
+            prompt_color = "#ff9f1c" if "negative" in label.lower() else "cyan"
             axis.add_patch(
                 patches.Rectangle(
                     (x0, y0), x1 - x0, y1 - y0,
-                    fill=False, edgecolor="cyan", linewidth=2, label="support prompt GT",
+                    fill=False, edgecolor=prompt_color, linewidth=2, label=label,
                 )
             )
     else:
@@ -1055,6 +1108,14 @@ def main() -> None:
                         help="Evaluate fixed training episodes and save qualitative plots at every evaluation step (default: enabled).")
     parser.add_argument("--train-sanity-samples", type=_parse_train_sanity_samples, default=8,
                         help="Train batches per evaluation (integer), or a fraction/percent of the train loader (e.g. 0.02 or 2%%).")
+    parser.add_argument("--train-sanity-deterministic", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the same seeded train sanity episodes at every eval and across reruns (default: enabled).")
+    parser.add_argument("--validation-sanity", action=argparse.BooleanOptionalAction, default=True,
+                        help="Save qualitative plots for a fixed seen-validation subset at every evaluation step (default: enabled).")
+    parser.add_argument("--validation-sanity-samples", type=_parse_train_sanity_samples, default=8,
+                        help="Seen-validation batches to plot (integer), or a fraction/percent of the validation loader.")
+    parser.add_argument("--validation-sanity-deterministic", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the same seeded seen-validation episodes at every eval and across reruns (default: enabled).")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--include-prompt-box-in-loss", action=argparse.BooleanOptionalAction, default=True,
@@ -1063,6 +1124,10 @@ def main() -> None:
     parser.add_argument(
         "--evaluate-prompt-box-iou", action=argparse.BooleanOptionalAction, default=True,
         help="Report IoU of the top prediction against the prompted box separately (default: enabled).",
+    )
+    parser.add_argument(
+        "--coco-map-include-prompt-box", action=argparse.BooleanOptionalAction, default=True,
+        help="Count the prompted instance as a GT detection for same-image COCO mAP (default: enabled).",
     )
     parser.add_argument("--coco-eval-batch-size", type=int, default=8)
     parser.add_argument("--num-queries", type=int, default=100)
@@ -1087,8 +1152,14 @@ def main() -> None:
         "--inference-extra-predictions", type=int, default=0,
         help="Draw this many extra low-ranked predictions beyond the query GT count (default: 0).",
     )
-    parser.add_argument("--selection-metric", choices=("episodic_iou",), default="episodic_iou")
-    parser.add_argument("--coco-selection-images", type=int, default=500)
+    parser.add_argument(
+        "--selection-metric", choices=("episodic_iou", "coco_map"), default="episodic_iou",
+        help="Validation metric used to select the best checkpoint.",
+    )
+    parser.add_argument(
+        "--coco-selection-images", type=int, default=500,
+        help="Unique validation images used for same-image COCO mAP checkpoint selection (default: 500).",
+    )
     parser.add_argument("--output", type=Path, default=Path("logs/promptable_fewshot.pt"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parse_args_with_python_config(parser)
@@ -1102,6 +1173,8 @@ def main() -> None:
         parser.error("--inference-extra-predictions must be non-negative")
     if args.max_eval_checkpoints <= 0:
         parser.error("--max-eval-checkpoints must be positive")
+    if args.coco_selection_images <= 0:
+        parser.error("--coco-selection-images must be positive")
     if not 0.0 <= args.warmup_start_factor <= 1.0:
         parser.error("--warmup-start-factor must be in [0, 1]")
     if not 0.0 <= args.min_lr_ratio <= 1.0:
@@ -1164,13 +1237,24 @@ def main() -> None:
         num_workers=4, pin_memory=True, generator=torch.Generator().manual_seed(args.seed + 3),
     )
     train_sanity_loader = (
-        _build_train_sanity_loader(train_dataset, args.batch_size, args.train_sanity_samples, args.seed)
+        _build_fixed_diagnostic_loader(train_dataset, args.batch_size, args.train_sanity_samples, args.seed)
         if args.train_sanity else None
+    )
+    validation_sanity_loader = (
+        _build_fixed_diagnostic_loader(
+            val_dataset, args.batch_size, args.validation_sanity_samples, args.seed + 1
+        )
+        if args.validation_sanity else None
     )
     if train_sanity_loader is not None:
         print(
             f"train sanity enabled: {len(train_sanity_loader)} fixed batches per eval; "
             f"plots under {args.figure_dir / 'train_sanity'}"
+        )
+    if validation_sanity_loader is not None:
+        print(
+            f"seen validation plots enabled: {len(validation_sanity_loader)} fixed batches per eval; "
+            f"plots under {args.figure_dir / 'validation_seen'}"
         )
 
     model = build_model(args.resolution, args.num_queries, args.device)
@@ -1306,14 +1390,36 @@ def main() -> None:
                 model, val_loader, device,
                 evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
             )
+            coco_selection = run_coco_map_eval(
+                model,
+                val_dataset,
+                device,
+                query_batch_size=args.coco_eval_batch_size,
+                seed=args.seed,
+                max_query_images=args.coco_selection_images,
+                include_prompt_box_as_target=args.coco_map_include_prompt_box,
+            )
             metrics[f"validation_step_{step + 1}"] = {
                 "episodic": val_result,
-                "selection_note": "same-image prompted recall uses the episodic IoU metric",
+                "coco_selection": coco_selection,
+                "selection_note": (
+                    "same-image COCO mAP on a deterministic promptable episode subset"
+                    if args.selection_metric == "coco_map"
+                    else "same-image episodic top-prediction IoU"
+                ),
             }
             if train_sanity_loader is not None:
+                current_train_sanity_loader = train_sanity_loader
+                if not args.train_sanity_deterministic:
+                    current_train_sanity_loader = _build_fixed_diagnostic_loader(
+                        train_dataset,
+                        args.batch_size,
+                        args.train_sanity_samples,
+                        args.seed + step + 1,
+                    )
                 sanity_result = run_train_sanity_eval(
                     model,
-                    train_sanity_loader,
+                    current_train_sanity_loader,
                     device,
                     args.figure_dir / "train_sanity" / f"step_{step + 1:06d}",
                     step + 1,
@@ -1333,6 +1439,33 @@ def main() -> None:
                     f"negative_score={sanity_result['mean_negative_score']} "
                     f"plots={args.figure_dir / 'train_sanity' / f'step_{step + 1:06d}'}"
                 )
+            if validation_sanity_loader is not None:
+                current_validation_sanity_loader = validation_sanity_loader
+                if not args.validation_sanity_deterministic:
+                    current_validation_sanity_loader = _build_fixed_diagnostic_loader(
+                        val_dataset,
+                        args.batch_size,
+                        args.validation_sanity_samples,
+                        args.seed + step + 1,
+                    )
+                validation_plot_result = run_train_sanity_eval(
+                    model,
+                    current_validation_sanity_loader,
+                    device,
+                    args.figure_dir / "validation_seen" / f"step_{step + 1:06d}",
+                    step + 1,
+                    plot_mode=args.inference_plot_mode,
+                    extra_predictions=args.inference_extra_predictions,
+                    evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
+                )
+                metrics[f"validation_plots_step_{step + 1}"] = validation_plot_result
+                print(
+                    f"seen validation plots step={step + 1} "
+                    f"samples={validation_plot_result['sample_count']} "
+                    f"positive_iou={validation_plot_result['mean_positive_iou']} "
+                    f"prompt_iou={validation_plot_result['mean_prompt_iou']} "
+                    f"plots={args.figure_dir / 'validation_seen' / f'step_{step + 1:06d}'}"
+                )
             save_rfdetr_training_plots(
                 plot_train_records,
                 metrics,
@@ -1340,10 +1473,18 @@ def main() -> None:
                 plot_output_dir,
             )
             print(f"updated RF-DETR metric plots under {plot_output_dir}")
-            score = float(val_result["macro_positive_iou"])
+            if args.selection_metric == "coco_map":
+                score = (
+                    float(coco_selection["mAP"])
+                    if coco_selection["mAP"] is not None
+                    else float("-inf")
+                )
+            else:
+                score = float(val_result["macro_positive_iou"])
             print(
                 f"validation step={step + 1} selection_metric={args.selection_metric} "
-                f"score={score:.4f}"
+                f"score={score:.4f} episodic_iou={val_result['macro_positive_iou']:.4f} "
+                f"coco_mAP={coco_selection['mAP']}"
             )
             if args.checkpoint_every_eval:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1380,12 +1521,28 @@ def main() -> None:
         model, val_loader, device,
         evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
     )
+    metrics["seen_validation_coco"] = run_coco_map_eval(
+        model,
+        val_dataset,
+        device,
+        query_batch_size=args.coco_eval_batch_size,
+        seed=args.seed,
+        include_prompt_box_as_target=args.coco_map_include_prompt_box,
+    )
     metrics["held_out_test"] = run_episode_eval(
         model, test_loader, device, figure_dir=args.figure_dir / "heldout_test",
         max_figures_per_class=args.max_figures_per_class,
         plot_mode=args.inference_plot_mode,
         extra_predictions=args.inference_extra_predictions,
         evaluate_prompt_box_iou=args.evaluate_prompt_box_iou,
+    )
+    metrics["held_out_coco"] = run_coco_map_eval(
+        model,
+        test_dataset,
+        device,
+        query_batch_size=args.coco_eval_batch_size,
+        seed=args.seed + 1,
+        include_prompt_box_as_target=args.coco_map_include_prompt_box,
     )
     metrics["metric_protocol"] = (
         "same-image visual prompting; one instance box is the prompt and the remaining "

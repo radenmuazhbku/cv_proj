@@ -26,6 +26,7 @@ cfg = dict(
     coco_selection_images=100,
     batch_size=4,
     coco_eval_batch_size=4,
+    coco_map_include_prompt_box=True,
     num_queries=20,
     resolution=280,
     lr=1e-4,

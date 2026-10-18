@@ -81,7 +81,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--train-classes", nargs="+", type=int)
     parser.add_argument("--test-classes", nargs="+", type=int)
-    parser.add_argument("--train-images", type=int, default=10000)
+    parser.add_argument("--train-images", type=int, default=100_000)
     parser.add_argument("--support-images-per-class", type=int, default=5)
     parser.add_argument("--seed", type=int, default=7)
     args = parse_args_with_python_config(parser)

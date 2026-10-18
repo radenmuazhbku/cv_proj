@@ -87,7 +87,14 @@ def _line_style_for_split(split: str) -> str:
     return "-"
 
 
-def _plot_columns_on_axes(ax: Any, raw_df: Any, epoch_df: Any, metric_columns: list[str]) -> None:
+def _plot_columns_on_axes(
+    ax: Any,
+    raw_df: Any,
+    epoch_df: Any,
+    metric_columns: list[str],
+    *,
+    solid_lines: bool = False,
+) -> None:
     """Plot columns with color by metric name and line style by split.
 
     When seaborn is installed, draws mean ± 1 std-dev bands computed from within-epoch step-level rows in ``raw_df``.
@@ -108,7 +115,7 @@ def _plot_columns_on_axes(ax: Any, raw_df: Any, epoch_df: Any, metric_columns: l
         if metric_name not in metric_colors:
             metric_colors[metric_name] = color_cycle[len(metric_colors) % len(color_cycle)] if color_cycle else "C0"
         color = metric_colors[metric_name]
-        linestyle = _line_style_for_split(split)
+        linestyle = "-" if solid_lines else _line_style_for_split(split)
 
         if _IS_SEABORN_AVAILABLE:
             import seaborn as sns
@@ -274,6 +281,7 @@ def _plot_metric_groups(
     title: str,
     output_path: str | None,
     loss_log_scale: bool,
+    solid_lines: bool = False,
 ) -> Figure:
     """Build a figure for grouped metrics."""
     try:
@@ -298,7 +306,7 @@ def _plot_metric_groups(
 
     for idx, (subplot_title, metric_list) in enumerate(metric_groups.items()):
         ax = axes_flat[idx]
-        _plot_columns_on_axes(ax, raw_df, epoch_df, metric_list)
+        _plot_columns_on_axes(ax, raw_df, epoch_df, metric_list, solid_lines=solid_lines)
         ax.set_title(subplot_title, fontsize=13, fontweight="bold")
         ax.set_xlabel("Epoch", fontsize=11)
         ax.set_ylabel(subplot_title, fontsize=11)
@@ -370,6 +378,7 @@ def plot_loss_metrics(
         title="RF-DETR Loss Metrics",
         output_path=output_path,
         loss_log_scale=loss_log_scale,
+        solid_lines=True,
     )
 
 
