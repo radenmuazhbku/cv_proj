@@ -307,9 +307,12 @@ classifier weights using the `COCO_CLASSES` category-to-row mapping; it remains
 trainable with the other PCS parameters. Training configs use
 `negative_class_ratio=0.1` (about 9% absent-class episodes): the request class is absent
 from the query image, its target is empty, and the presence target is negative.
-The full-trainer configs set `pretrain_weights="rf-detr-base.pth"` and load that
-checkpoint before copying its classifier rows. The overfit diagnostics keep
-`pretrain_weights=None` to preserve their DINOv2-backbone-only setup.
+The full-trainer configs set `use_pretrained_model=True`. The PCS trainer uses
+the selected RF-DETR preset's own default MS COCO checkpoint (the Base preset
+defaults to `rf-detr-base.pth`) before initializing class embeddings. Set the
+flag to `False` to construct the preset without loading pretrained detector
+weights. A custom `pretrain_weights` path can still override the preset path
+when the flag is enabled.
 
 For separate support/query episodes there is one category ID per episode in
 class-embedding mode. The
@@ -417,6 +420,14 @@ Both visual modes retain optional segmentation training when
 `segmentation=True`; the support/query trainer can additionally apply
 `support_loss_weight` to support-image box/mask supervision.
 
+`include_prompt_box_in_loss` controls whether a prompted positive instance is
+also a detection/mask target. It defaults to `True`. In same-image mode it
+controls adding the prompt box to the query targets. In support/query mode it
+controls whether that specific prompted annotation is retained in the auxiliary
+support-image targets; the query-image targets are separate and unaffected. Set
+it to `False` to train the support auxiliary pass on the remaining instances
+only. The support/query curriculum config disables it.
+
 Old PCS checkpoints can warm-start the updated model: matching tensors load,
 new class/scoring/presence parameters keep their initialization, and incompatible
 classifier shapes are skipped with a message. If the old optimizer parameter
@@ -438,4 +449,60 @@ The active `pcs_fewshot_2_same_image.py` is the regular trainer config and sets
 `steps=100_000`. Its staged curriculum diagnostic remains available as
 `pcs_fewshot_2_same_image_overfit.py`, where `stage_steps` controls the three
 overfit stages.
+
+## Standard FSOD Benchmark Protocol & In-Context Learning (ICL)
+
+### Benchmark Protocol Overview
+Standard Few-Shot Object Detection (FSOD) evaluates model transfer onto novel categories using $K$-shot exemplars ($K \in \{1, 2, 3, 5, 10, 30\}$). In this repository:
+1. **PASCAL VOC**: 3 fixed splits (15 Base / 5 Novel each). Evaluated on full VOC 2012 `val` ($5{,}823$ images).
+2. **MS COCO**: 60 Base / 20 Novel (the 20 overlapping VOC classes). Evaluated on full COCO `val2017` ($5{,}000$ images).
+3. **Training-Free In-Context Learning (ICL)**: At test time, model parameters are completely frozen ($\nabla \theta = 0$). The $K$-shot support exemplars are fed through the visual prompt encoder as in-context visual prompts, conditioning the detector in feed-forward inference without any parameter fine-tuning.
+
+### Generated Splits & Data Prep
+- **VOC XML to COCO Converter**: [`scripts/convert_voc_to_coco.py`](file:///home/muaz/code/cv_proj/scripts/convert_voc_to_coco.py) converts VOC 2012 XML annotations and split lists (`train`, `val`, `trainval`) into standard COCO JSON format with segmentation polygons and deterministic integer image IDs.
+- **FSOD Split Generator**: [`scripts/rfdetr_pcs/generate_fsod_splits.py`](file:///home/muaz/code/cv_proj/scripts/rfdetr_pcs/generate_fsod_splits.py) generates:
+  - Base training sets with novel categories excluded:
+    - `datasets/voc_fsod_splits/split_1/voc_split1_base_train.json`
+    - `datasets/mscoco_fsod_splits/coco_base_train.json`
+  - Fixed $K$-shot support sets ($K \in \{1, 2, 3, 5, 10, 30\}$) sampled strictly from `train` sets with instance-level constraints (exactly $K$ instances per class).
+  - Unmodified full evaluation sets (`voc_2012_val.json`, `coco_val_full.json`), ensuring zero support-test leakage.
+
+### Standard Full Training Configurations (200k Steps Budget)
+Each configuration matches the 200,000-step budget of `rfdetr_pcs_fs10_1.py` with joint Bounding Box and Instance Segmentation (`segmentation=True`), 100 queries, resolution 560, and `COCOeval` evaluation:
+- **VOC Split 1 (1-Shot)**: [`configs/rfdetr_pcs/rfdetr_pcs_voc_split1_fs1.py`](file:///home/muaz/code/cv_proj/configs/rfdetr_pcs/rfdetr_pcs_voc_split1_fs1.py)
+- **VOC Split 1 (5-Shot)**: [`configs/rfdetr_pcs/rfdetr_pcs_voc_split1_fs5.py`](file:///home/muaz/code/cv_proj/configs/rfdetr_pcs/rfdetr_pcs_voc_split1_fs5.py)
+- **MS COCO (1-Shot)**: [`configs/rfdetr_pcs/rfdetr_pcs_coco_fs1.py`](file:///home/muaz/code/cv_proj/configs/rfdetr_pcs/rfdetr_pcs_coco_fs1.py)
+- **MS COCO (5-Shot)**: [`configs/rfdetr_pcs/rfdetr_pcs_coco_fs5.py`](file:///home/muaz/code/cv_proj/configs/rfdetr_pcs/rfdetr_pcs_coco_fs5.py)
+
+### Commands to Run Training
+
+```bash
+# PASCAL VOC Split 1 (1-Shot and 5-Shot)
+.venv/bin/python scripts/rfdetr_pcs/train_pcs.py --config configs/rfdetr_pcs/rfdetr_pcs_voc_split1_fs1.py
+.venv/bin/python scripts/rfdetr_pcs/train_pcs.py --config configs/rfdetr_pcs/rfdetr_pcs_voc_split1_fs5.py
+
+# MS COCO (1-Shot and 5-Shot)
+.venv/bin/python scripts/rfdetr_pcs/train_pcs.py --config configs/rfdetr_pcs/rfdetr_pcs_coco_fs1.py
+.venv/bin/python scripts/rfdetr_pcs/train_pcs.py --config configs/rfdetr_pcs/rfdetr_pcs_coco_fs5.py
+```
+
+### Official Evaluation & In-Context CLI
+- **Evaluator**: [`src/rfdetr_pcs/evaluation/fsod_eval.py`](file:///home/muaz/code/cv_proj/src/rfdetr_pcs/evaluation/fsod_eval.py) (`FSODEvaluator`) runs official `COCOeval` for both `bbox` and `segm`, computing $n\text{AP}$, $n\text{AP}_{50}$, $n\text{AP}_{75}$ (Novel), $b\text{AP}$, $b\text{AP}_{50}$ (Base), and $m\text{AP}$ (All).
+- **Training-Free In-Context Evaluation CLI**: [`scripts/rfdetr_pcs/evaluate_in_context_fsod.py`](file:///home/muaz/code/cv_proj/scripts/rfdetr_pcs/evaluate_in_context_fsod.py) runs feed-forward inference on a frozen checkpoint using $K$-shot visual prompts:
+
+```bash
+# Example: Evaluate 5-shot in-context learning on COCO novel classes
+.venv/bin/python scripts/rfdetr_pcs/evaluate_in_context_fsod.py \
+    --checkpoint <checkpoint.pt> \
+    --config configs/rfdetr_pcs/rfdetr_pcs_coco_fs5.py \
+    --support-annotation datasets/mscoco_fsod_splits/coco_fsod_novel_5shot_seed0.json \
+    --support-image-dir datasets/mscoco/train2017 \
+    --test-annotation datasets/mscoco_fsod_splits/coco_val_full.json \
+    --test-image-dir datasets/mscoco/val2017 \
+    --novel-categories 1 2 3 4 5 6 7 9 16 17 18 19 20 21 44 62 63 64 67 72 \
+    --shots 5 \
+    --segmentation \
+    --output-json logs/coco_fs5_icl_eval.json
+```
+
 

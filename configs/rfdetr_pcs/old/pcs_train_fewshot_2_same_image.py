@@ -1,16 +1,11 @@
-"""Train a known-class prompt warmup, then switch to visual-only PCS prompts."""
+"""Full PCS training: same-image instance box prompts on COCO splits."""
 
 from pathlib import Path
 
 cfg = {
     "mode": "same_image",
-    "conditioning_mode": "visual_prompt",
-    "conditioning_schedule": [
-        {"mode": "class_embedding", "steps": 10_000},
-        {"mode": "visual_prompt", "steps": 90_000},
-    ],
     "seed": 7,
-    "pretrain_weights": "rf-detr-base.pth",
+    "use_pretrained_model": True,
     "train_image_dir": Path("datasets/mscoco/train2017"),
     "train_annotation_file": Path("datasets/mscoco_prompt_split/train.json"),
     "validation_image_dir": Path("datasets/mscoco/val2017"),
@@ -19,9 +14,11 @@ cfg = {
     "test_annotation_file": Path("datasets/mscoco_prompt_split/unseen_test.json"),
     "episodes": 80_000,
     "max_shots": 1,
+    # Empty-remainder episodes teach the model to stop when all instances have
+    # been prompted. This is separate from negative box prompts below.
     "negative_ratio": 0.05,
     "negative_prompt_ratio": 0.0,
-    "negative_class_ratio": 0.0,
+    "negative_class_ratio": 0.1,
     "pretrained_class_count": 90,
     "num_prompt_classes": 91,
     "init_class_embeddings_from_detector": True,
@@ -59,6 +56,6 @@ cfg = {
     "evaluate_test_at_end": True,
     "max_checkpoints": 3,
     "device": "cuda",
-    "output_dir": Path("logs/rfdetr_pcs_train_class_to_visual_curriculum"),
-    "figure_dir": Path("logs/rfdetr_pcs_train_class_to_visual_curriculum/figures"),
+    "output_dir": Path("logs/rfdetr_pcs_train_fewshot_2_same_image"),
+    "figure_dir": Path("logs/rfdetr_pcs_train_fewshot_2_same_image/figures"),
 }

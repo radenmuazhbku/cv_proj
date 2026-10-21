@@ -90,9 +90,9 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                 self.support_category_images.setdefault(category_id, []).append(image_id)
         if self.has_separate_support:
             overlap = set(self.coco.getImgIds()) & set(self.support_coco.getImgIds())
-            if overlap:
+            if overlap and not self.training:
                 raise ValueError(
-                    f"support and query annotation files overlap on {len(overlap)} image IDs"
+                    f"support and query annotation files overlap on {len(overlap)} image IDs during evaluation"
                 )
             self.category_ids = [
                 category_id for category_id in self.category_ids
@@ -163,6 +163,15 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
             dtype=torch.float32,
         )
 
+    @staticmethod
+    def _ann_to_mask(coco: COCO, ann: dict[str, Any], width: int, height: int) -> Tensor:
+        if "segmentation" in ann and ann["segmentation"]:
+            return torch.from_numpy(coco.annToMask(ann).copy()).unsqueeze(0)
+        x, y, w, h = [int(round(v)) for v in ann["bbox"]]
+        mask = torch.zeros((1, height, width), dtype=torch.uint8)
+        mask[0, max(0, y) : min(height, y + h), max(0, x) : min(width, x + w)] = 1
+        return mask
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         rng = random.Random(self.seed + index)
         if self.has_separate_support:
@@ -206,7 +215,7 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                 target_masks = torch.stack(
                     [
                         TF.resize(
-                            torch.from_numpy(self.coco.annToMask(ann).copy()).unsqueeze(0),
+                            self._ann_to_mask(self.coco, ann, query_width, query_height),
                             [self.resolution, self.resolution],
                             interpolation=InterpolationMode.NEAREST,
                         ).squeeze(0).bool()
@@ -218,12 +227,21 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
 
             support_ids = sorted(self.support_category_images[category_id])
             if self.training:
-                support_ids = rng.sample(support_ids, self.max_shots)
+                # Exclude query_id so support and query images are strictly disjoint
+                candidate_support_ids = [sid for sid in support_ids if sid != query_id]
+                if len(candidate_support_ids) >= self.max_shots:
+                    support_ids = rng.sample(candidate_support_ids, self.max_shots)
+                else:
+                    support_ids = rng.sample(support_ids, min(self.max_shots, len(support_ids)))
             else:
+                candidate_support_ids = [sid for sid in support_ids if sid != query_id]
+                if candidate_support_ids:
+                    support_ids = candidate_support_ids
                 start = (self.seed + query_id + category_id) % len(support_ids)
                 support_ids = [support_ids[(start + shot) % len(support_ids)] for shot in range(self.max_shots)]
             support_images, support_boxes, support_labels, support_prompt_valid = [], [], [], []
-            support_target_boxes, support_target_masks, support_prompt_masks = [], [], []
+            support_target_boxes, support_target_masks, support_target_prompt_masks = [], [], []
+            support_prompt_masks = []
             prompt_annotations, support_prompt_annotation_ids = [], []
             for support_id in support_ids:
                 all_support_annotations = self.support_image_annotations[support_id]
@@ -257,17 +275,21 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                     self._normalize_box(ann["bbox"], support_width, support_height)
                     for ann in support_annotations
                 ]))
+                support_target_prompt_masks.append(torch.tensor(
+                    [ann["id"] == prompt_annotation["id"] for ann in support_annotations],
+                    dtype=torch.bool,
+                ))
                 if self.include_masks:
                     support_prompt_masks.append(
                         TF.resize(
-                            torch.from_numpy(self.support_coco.annToMask(prompt_annotation).copy()).unsqueeze(0),
+                            self._ann_to_mask(self.support_coco, prompt_annotation, support_width, support_height),
                             [self.resolution, self.resolution],
                             interpolation=InterpolationMode.NEAREST,
                         ).squeeze(0).bool()
                     )
                     support_target_masks.append(torch.stack([
                         TF.resize(
-                            torch.from_numpy(self.support_coco.annToMask(ann).copy()).unsqueeze(0),
+                            self._ann_to_mask(self.support_coco, ann, support_width, support_height),
                             [self.resolution, self.resolution],
                             interpolation=InterpolationMode.NEAREST,
                         ).squeeze(0).bool()
@@ -290,6 +312,7 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                 "support_prompt_labels": padded_support_labels,
                 "support_prompt_valid": padded_support_valid,
                 "support_target_boxes": support_target_boxes,
+                "support_target_prompt_masks": support_target_prompt_masks,
                 "support_prompt_masks": torch.stack(support_prompt_masks) if self.include_masks else None,
                 "support_target_masks": support_target_masks if self.include_masks else None,
                 "query_image": query_tensor,
@@ -379,7 +402,7 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
         if self.include_masks:
             target_masks = torch.stack([
                     TF.resize(
-                        torch.from_numpy(self.coco.annToMask(ann).copy()).unsqueeze(0),
+                        self._ann_to_mask(self.coco, ann, query_width, query_height),
                         [self.resolution, self.resolution],
                         interpolation=InterpolationMode.NEAREST,
                     ).squeeze(0).bool()
@@ -387,7 +410,7 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                 ]) if target_annotations else torch.zeros((0, self.resolution, self.resolution), dtype=torch.bool)
             prompt_masks = torch.stack([
                 TF.resize(
-                    torch.from_numpy(self.coco.annToMask(ann).copy()).unsqueeze(0),
+                    self._ann_to_mask(self.coco, ann, query_width, query_height),
                     [self.resolution, self.resolution],
                     interpolation=InterpolationMode.NEAREST,
                 ).squeeze(0).bool()
@@ -395,7 +418,8 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
             ])
         present = float(not negative_class_episode)
         return {
-            "support_images": query_tensor.unsqueeze(0).expand(len(prompt_annotations), -1, -1, -1),
+            # In same-image mode, prompts belong to query_image itself. We avoid duplicating query_tensor.
+            "support_images": query_tensor.unsqueeze(0),
             "support_boxes": prompt_boxes,
             "query_image": query_tensor,
             "target_boxes": target_boxes,
@@ -524,11 +548,16 @@ def collate_support_query(batch: list[dict[str, Any]]) -> dict[str, Any]:
     support_target_mask = torch.zeros(
         (len(batch), support_count, max_support_targets), dtype=torch.bool
     )
+    support_target_prompt_mask = torch.zeros(
+        (len(batch), support_count, max_support_targets), dtype=torch.bool
+    )
     for batch_index, item in enumerate(batch):
         for shot_index, boxes in enumerate(item["support_target_boxes"]):
             count = boxes.shape[0]
             support_target_boxes[batch_index, shot_index, :count] = boxes
             support_target_mask[batch_index, shot_index, :count] = True
+            prompt_mask = item["support_target_prompt_masks"][shot_index]
+            support_target_prompt_mask[batch_index, shot_index, :count] = prompt_mask
     result: dict[str, Any] = {
         "support_images": torch.stack([item["support_images"] for item in batch]),
         "support_boxes": support_boxes,
@@ -540,6 +569,7 @@ def collate_support_query(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "present": torch.tensor([float(item["present"]) for item in batch], dtype=torch.float32),
         "support_target_boxes": support_target_boxes,
         "support_target_mask": support_target_mask,
+        "support_target_prompt_mask": support_target_prompt_mask,
         "category_ids": [item["category_id"] for item in batch],
         "query_image_ids": [item["query_image_id"] for item in batch],
         "support_image_ids": [item["support_image_ids"] for item in batch],

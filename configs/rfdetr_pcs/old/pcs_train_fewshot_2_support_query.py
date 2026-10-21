@@ -1,30 +1,35 @@
-"""Full same-image PCS: visual box prompts only, no class embedding input."""
+"""Full PCS training: two separate support images condition COCO query images."""
 
 from pathlib import Path
 
 cfg = {
-    "mode": "same_image",
-    "conditioning_mode": "visual_prompt",
+    "mode": "support_query",
     "seed": 7,
-    "pretrain_weights": "rf-detr-base.pth",
+    "use_pretrained_model": True,
     "train_image_dir": Path("datasets/mscoco/train2017"),
     "train_annotation_file": Path("datasets/mscoco_prompt_split/train.json"),
+    "train_support_image_dir": Path("datasets/mscoco/val2017"),
+    "train_support_annotation_file": Path("datasets/mscoco_prompt_split/seen_support.json"),
     "validation_image_dir": Path("datasets/mscoco/val2017"),
     "validation_annotation_file": Path("datasets/mscoco_prompt_split/seen_val.json"),
+    "validation_support_image_dir": Path("datasets/mscoco/val2017"),
+    "validation_support_annotation_file": Path("datasets/mscoco_prompt_split/seen_support.json"),
     "test_image_dir": Path("datasets/mscoco/val2017"),
     "test_annotation_file": Path("datasets/mscoco_prompt_split/unseen_test.json"),
+    "test_support_image_dir": Path("datasets/mscoco/val2017"),
+    "test_support_annotation_file": Path("datasets/mscoco_prompt_split/unseen_support.json"),
     "episodes": 80_000,
-    "max_shots": 1,
-    "negative_ratio": 0.05,
+    "shots": 2,
     "negative_prompt_ratio": 0.0,
-    # Same-image visual episodes need at least one positive visual exemplar;
-    # absent-class episodes have no positive support evidence.
-    "negative_class_ratio": 0.0,
-    "include_prompt_box_in_loss": True,
+    "negative_class_ratio": 0.1,
+    "pretrained_class_count": 90,
+    "num_prompt_classes": 91,
+    "init_class_embeddings_from_detector": True,
+    "support_loss_weight": 0.5,
     "steps": 100_000,
     "batch_repeat": 1,
-    "batch_size": 4,
-    "eval_batch_size": 4,
+    "batch_size": 2,
+    "eval_batch_size": 2,
     "num_workers": 4,
     "resolution": 560,
     "num_queries": 100,
@@ -54,6 +59,6 @@ cfg = {
     "evaluate_test_at_end": True,
     "max_checkpoints": 3,
     "device": "cuda",
-    "output_dir": Path("logs/rfdetr_pcs_train_fewshot_2_same_image_visual"),
-    "figure_dir": Path("logs/rfdetr_pcs_train_fewshot_2_same_image_visual/figures"),
+    "output_dir": Path("logs/rfdetr_pcs_train_fewshot_2_support_query"),
+    "figure_dir": Path("logs/rfdetr_pcs_train_fewshot_2_support_query/figures"),
 }

@@ -34,11 +34,13 @@ from rfdetr_pcs.coco_episodes import (  # noqa: E402
     collate_few_shot,
     collate_support_query,
 )
-from rfdetr_pcs.config import RFDETRBaseConfig, TrainConfig  # noqa: E402
+from rfdetr_pcs.config import TrainConfig  # noqa: E402
+from rfdetr_pcs.model_presets import build_base_model_config  # noqa: E402
 from rfdetr_pcs.conditioning import (  # noqa: E402
     class_ids_for_mode, conditioning_mode_at, conditioning_schedule, uses_class_embeddings,
 )
 from rfdetr_pcs.models.pcs import PCSDetector  # noqa: E402
+from rfdetr_pcs.evaluation.fsod_eval import FSODEvaluator  # noqa: E402
 from rfdetr_pcs.utilities.box_ops import box_cxcywh_to_xyxy  # noqa: E402
 from scripts.rfdetr_promptable.train_promptable_fewshot import (  # noqa: E402
     _save_query_support_figure,
@@ -118,9 +120,13 @@ def _query_targets(batch: dict[str, Any], device: torch.device) -> list[dict[str
     return targets
 
 
-def _support_targets(batch: dict[str, Any], device: torch.device) -> list[dict[str, torch.Tensor]]:
+def _support_targets(
+    batch: dict[str, Any], device: torch.device, include_prompt_box: bool = True
+) -> list[dict[str, torch.Tensor]]:
     boxes = batch["support_target_boxes"].flatten(0, 1)
     valid = batch["support_target_mask"].flatten(0, 1)
+    if not include_prompt_box and "support_target_prompt_mask" in batch:
+        valid = valid & ~batch["support_target_prompt_mask"].flatten(0, 1)
     masks = batch.get("support_target_masks")
     if masks is not None:
         masks = masks.flatten(0, 1)
@@ -352,6 +358,7 @@ def evaluate(
     extra_predictions: int = 0,
     step: int = 0,
     conditioning_mode: str = "visual_prompt",
+    evaluator: FSODEvaluator | None = None,
 ) -> dict[str, float | int | None]:
     was_training = model.training
     model.eval()
@@ -414,10 +421,23 @@ def evaluate(
                 step, figure_count, plot_mode, extra_predictions,
             )
             plotted += figure_count
+
+        if evaluator is not None and "query_image_ids" in batch and len(batch["query_image_ids"]) > 0:
+            meta_list = dataset.coco.loadImgs([int(qid) for qid in batch["query_image_ids"]])
+            meta_map = {int(m["id"]): (m["height"], m["width"]) for m in meta_list}
+            image_sizes = [meta_map[int(qid)] for qid in batch["query_image_ids"]]
+            evaluator.add_predictions(
+                image_ids=batch["query_image_ids"],
+                category_ids=batch["category_ids"],
+                output=output,
+                image_sizes=image_sizes,
+                include_masks=bool(dataset.include_masks),
+            )
+
     if was_training:
         model.train()
     denominator = max(1, episodes)
-    return {
+    res: dict[str, float | int | None | dict[str, Any]] = {
         **{key: value / denominator for key, value in loss_sums.items()},
         "matched_box_iou": box_iou_sum / box_iou_count if box_iou_count else None,
         "matched_mask_iou": mask_intersection / mask_union if mask_union else None,
@@ -427,6 +447,31 @@ def evaluate(
         "episodes": int(episodes),
         "empty_target_episodes": int(empty_episodes),
     }
+    if evaluator is not None:
+        coco_metrics = evaluator.evaluate()
+        res["coco_eval"] = coco_metrics
+        for iou_type, stats in coco_metrics.items():
+            if isinstance(stats, dict):
+                for metric_name, val in stats.items():
+                    res[f"{iou_type}_{metric_name}"] = val
+    return res
+
+
+def _build_evaluator(cfg: dict[str, Any], split: str) -> FSODEvaluator | None:
+    if not bool(cfg.get(f"{split}_coco_eval", cfg.get("compute_coco_eval", False))):
+        return None
+    annotation_file = cfg.get(f"{split}_annotation_file")
+    if not annotation_file or not Path(annotation_file).exists():
+        return None
+    novel_ids = set(cfg.get("novel_category_ids", []))
+    base_ids = set(cfg.get("base_category_ids", []))
+    iou_types = ("bbox", "segm") if bool(cfg.get("segmentation", True)) else ("bbox",)
+    return FSODEvaluator(
+        annotation_file,
+        novel_cat_ids=novel_ids,
+        base_cat_ids=base_ids,
+        iou_types=iou_types,
+    )
 
 
 def _lr_at(cfg: dict[str, Any], step: int, total_steps: int) -> float:
@@ -494,20 +539,7 @@ def _retain_checkpoints(output_dir: Path, maximum: int, protected: set[Path]) ->
 
 
 def _build_model(cfg: dict[str, Any], device: torch.device, output_dir: Path) -> PCSDetector:
-    model_config = RFDETRBaseConfig(
-        pretrain_weights=cfg.get("pretrain_weights", "rf-detr-base.pth"),
-        resolution=int(cfg["resolution"]),
-        positional_encoding_size=int(cfg.get("positional_encoding_size", 37)),
-        num_queries=int(cfg.get("num_queries", 100)),
-        num_select=int(cfg.get("num_queries", 100)),
-        # Keep the pretrained COCO classifier available to initialize PCS class tokens.
-        num_classes=int(cfg.get("pretrained_class_count", 90)),
-        group_detr=1,
-        two_stage=False,
-        bbox_reparam=bool(cfg.get("bbox_reparam", False)),
-        segmentation_head=bool(cfg.get("segmentation", True)),
-        device=str(device),
-    )
+    model_config = build_base_model_config(cfg, device)
     return PCSDetector.from_config(
         model_config, TrainConfig(dataset_dir=".", output_dir=str(output_dir)),
         num_prompt_classes=int(cfg.get("num_prompt_classes", 91)),
@@ -675,7 +707,7 @@ def main() -> None:
             total_loss = _weighted_loss(model, query_losses)
             support_losses = None
             if support_output is not None:
-                support_targets = _support_targets(batch, device)
+                support_targets = _support_targets(batch, device, include_prompt_box)
                 support_losses = model.losses(support_output, support_targets)
                 total_loss = total_loss + support_loss_weight * _weighted_loss(model, support_losses)
 
@@ -720,12 +752,14 @@ def main() -> None:
             val_fig_dir = None
             if bool(cfg.get("validation_sanity", True)):
                 val_fig_dir = figure_dir / "validation_seen" / f"step_{global_step:08d}"
+            val_evaluator = _build_evaluator(cfg, "validation")
             val_result = evaluate(
                 model, val_loader, validation_dataset, mode, device,
                 include_prompt_box, val_fig_dir,
                 val_plot_count if val_fig_dir is not None else 0,
                 plot_mode, extra_predictions, global_step,
                 conditioning_mode_at(cfg, global_step - 1),
+                evaluator=val_evaluator,
             )
             sanity_result = None
             if bool(cfg.get("train_sanity", True)):
@@ -775,9 +809,16 @@ def main() -> None:
             _save_checkpoint(output_dir / "last.pt", model, optimizer, global_step, best_score, cfg)
             protected = {best_path} if best_path.exists() else set()
             _retain_checkpoints(output_dir, int(cfg.get("max_checkpoints", 3)), protected)
+            coco_msg = ""
+            if "bbox_mAP_50" in val_result:
+                coco_msg += f" box_mAP50={val_result['bbox_mAP_50']:.3f}"
+            if "bbox_novel_mAP_50" in val_result:
+                coco_msg += f" novel_mAP50={val_result['bbox_novel_mAP_50']:.3f}"
+            if "segm_mAP_50" in val_result:
+                coco_msg += f" segm_mAP50={val_result['segm_mAP_50']:.3f}"
             tqdm.write(
                 f"eval step={global_step} val_box_iou={val_result.get('matched_box_iou')} "
-                f"val_mask_iou={val_result.get('matched_mask_iou')} "
+                f"val_mask_iou={val_result.get('matched_mask_iou')}{coco_msg} "
                 f"val_loss={val_result.get('loss_total'):.4f} best={best_score:.4f}"
             )
 
@@ -786,12 +827,14 @@ def main() -> None:
         best_checkpoint = torch.load(test_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(best_checkpoint["model"])
         selected_step = int(best_checkpoint.get("step", steps))
+        test_evaluator = _build_evaluator(cfg, "test")
         test_result = evaluate(
             model, test_loader, test_dataset, mode, device, include_prompt_box,
             figure_dir / "test" if bool(cfg.get("test_sanity", True)) else None,
             int(cfg.get("test_sanity_samples", 16)) if bool(cfg.get("test_sanity", True)) else 0,
             plot_mode, extra_predictions, selected_step,
             conditioning_mode_at(cfg, max(0, selected_step - 1)),
+            evaluator=test_evaluator,
         )
         (output_dir / "test_metrics.json").write_text(json.dumps({
             "checkpoint": str(test_checkpoint), "step": selected_step, "test": test_result,

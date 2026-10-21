@@ -1,15 +1,16 @@
-"""Full train/validation/test PCS run with same-image box prompts.
-
-Run with scripts/rfdetr_pcs/train_pcs.py. The staged overfit diagnostic is in
-pcs_fewshot_2_same_image_overfit.py and uses a different trainer.
-"""
+"""Train a known-class prompt warmup, then switch to visual-only PCS prompts."""
 
 from pathlib import Path
 
 cfg = {
     "mode": "same_image",
+    "conditioning_mode": "visual_prompt",
+    "conditioning_schedule": [
+        {"mode": "class_embedding", "steps": 100_000},
+        {"mode": "visual_prompt", "steps": 400_000},
+    ],
     "seed": 7,
-    "pretrain_weights": "rf-detr-base.pth",
+    "use_pretrained_model": True,
     "train_image_dir": Path("datasets/mscoco/train2017"),
     "train_annotation_file": Path("datasets/mscoco_prompt_split/train.json"),
     "validation_image_dir": Path("datasets/mscoco/val2017"),
@@ -20,13 +21,13 @@ cfg = {
     "max_shots": 1,
     "negative_ratio": 0.05,
     "negative_prompt_ratio": 0.0,
-    "negative_class_ratio": 0.1,
+    "negative_class_ratio": 0.0,
     "pretrained_class_count": 90,
     "num_prompt_classes": 91,
     "init_class_embeddings_from_detector": True,
     "include_prompt_box_in_loss": True,
     "steps": 500_000,
-    "batch_repeat": 4,
+    "batch_repeat": 1,
     "batch_size": 4,
     "eval_batch_size": 4,
     "num_workers": 4,
@@ -42,8 +43,8 @@ cfg = {
     "warmup_start_factor": 0.1,
     "min_lr_ratio": 0.01,
     "clip_grad_norm": 0.1,
-    "log_every": 100,
-    "eval_every": 5_000,
+    "log_every": 10_000,
+    "eval_every": 100_000,
     "validation_episodes": 2_000,
     "test_episodes": 2_000,
     "selection_metric": "matched_box_iou",
@@ -58,6 +59,6 @@ cfg = {
     "evaluate_test_at_end": True,
     "max_checkpoints": 3,
     "device": "cuda",
-    "output_dir": Path("logs/rfdetr_pcs_fewshot_2_same_image_full"),
-    "figure_dir": Path("logs/rfdetr_pcs_fewshot_2_same_image_full/figures"),
+    "output_dir": Path("logs/rfdetr_pcs_train_class_to_visual_curriculum"),
+    "figure_dir": Path("logs/rfdetr_pcs_train_class_to_visual_curriculum/figures"),
 }

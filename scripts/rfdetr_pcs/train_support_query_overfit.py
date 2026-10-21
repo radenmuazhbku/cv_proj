@@ -22,8 +22,9 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from rfdetr_pcs.coco_episodes import CocoFewShotEpisodeDataset, collate_support_query
-from rfdetr_pcs.config import RFDETRBaseConfig, TrainConfig
+from rfdetr_pcs.config import TrainConfig
 from rfdetr_pcs.conditioning import class_ids_for_mode, uses_class_embeddings
+from rfdetr_pcs.model_presets import build_base_model_config
 from rfdetr_pcs.models.pcs import PCSDetector
 from rfdetr_pcs.utilities.box_ops import box_cxcywh_to_xyxy
 from scripts.rfdetr_promptable.train_promptable_fewshot import _save_query_support_figure
@@ -59,9 +60,13 @@ def target_dicts(batch: dict[str, Any], device: torch.device) -> list[dict[str, 
     return result
 
 
-def support_target_dicts(batch: dict[str, Any], device: torch.device) -> list[dict[str, torch.Tensor]]:
+def support_target_dicts(
+    batch: dict[str, Any], device: torch.device, include_prompt_box: bool = True
+) -> list[dict[str, torch.Tensor]]:
     boxes = batch["support_target_boxes"].to(device).flatten(0, 1)
     valid = batch["support_target_mask"].to(device).flatten(0, 1)
+    if not include_prompt_box and "support_target_prompt_mask" in batch:
+        valid &= ~batch["support_target_prompt_mask"].to(device).flatten(0, 1)
     masks = batch.get("support_target_masks")
     if masks is not None:
         masks = masks.to(device).flatten(0, 1)
@@ -93,6 +98,7 @@ def evaluate(
     output_dir: Path,
     step: int,
     conditioning_mode: str = "visual_prompt",
+    include_prompt_box: bool = True,
 ) -> dict[str, float | None]:
     model.eval()
     loader = DataLoader(Subset(dataset, indices), batch_size=2, shuffle=False, num_workers=0,
@@ -115,7 +121,7 @@ def evaluate(
         support_output = output.pop("support_outputs")
         targets = target_dicts(batch, device)
         losses = model.losses(output, targets, batch["present"].reshape(-1))
-        support_targets = support_target_dicts(batch, device)
+        support_targets = support_target_dicts(batch, device, include_prompt_box)
         support_losses = model.losses(support_output, support_targets)
         weighted_total += float(sum(
             value * model.criterion.weight_dict[name]
@@ -238,13 +244,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     resolution = int(cfg.get("resolution", 280))
     segmentation = bool(cfg.get("segmentation", True))
-    model_config = RFDETRBaseConfig(
-        pretrain_weights=cfg.get("pretrain_weights"), resolution=resolution,
-        positional_encoding_size=int(cfg.get("positional_encoding_size", 37)),
-        num_queries=int(cfg.get("num_queries", 20)), num_select=int(cfg.get("num_queries", 20)),
-        num_classes=int(cfg.get("pretrained_class_count", 90)), group_detr=1, two_stage=False,
-        bbox_reparam=bool(cfg.get("bbox_reparam", False)), segmentation_head=segmentation, device=str(device),
-    )
+    model_config = build_base_model_config(cfg, device, segmentation=segmentation)
     model = PCSDetector.from_config(
         model_config, TrainConfig(dataset_dir=".", output_dir=str(output_dir)),
         num_prompt_classes=int(cfg.get("num_prompt_classes", 91)),
@@ -284,7 +284,10 @@ def main() -> None:
         )
         support_output = output.pop("support_outputs")
         losses = model.losses(output, target_dicts(batch, device), batch["present"].reshape(-1))
-        support_losses = model.losses(support_output, support_target_dicts(batch, device))
+        include_prompt_box = bool(cfg.get("include_prompt_box_in_loss", True))
+        support_losses = model.losses(
+            support_output, support_target_dicts(batch, device, include_prompt_box)
+        )
         query_total = sum(value * model.criterion.weight_dict[name]
                           for name, value in losses.items() if name in model.criterion.weight_dict)
         support_total = sum(value * model.criterion.weight_dict[name]
@@ -299,6 +302,7 @@ def main() -> None:
             record = {"step": step, **evaluate(
                 model, dataset, indices, device, output_dir, step,
                 str(cfg.get("conditioning_mode", "visual_prompt")),
+                bool(cfg.get("include_prompt_box_in_loss", True)),
             )}
             metrics.append(record)
             (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))

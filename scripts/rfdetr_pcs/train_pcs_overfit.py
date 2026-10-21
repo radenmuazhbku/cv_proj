@@ -25,8 +25,9 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from rfdetr_pcs.coco_episodes import CocoFewShotEpisodeDataset, collate_few_shot
-from rfdetr_pcs.config import RFDETRBaseConfig, TrainConfig
+from rfdetr_pcs.config import TrainConfig
 from rfdetr_pcs.conditioning import class_ids_for_mode, conditioning_mode_at, uses_class_embeddings
+from rfdetr_pcs.model_presets import build_base_model_config
 from rfdetr_pcs.models.pcs import PCSDetector
 from rfdetr_pcs.utilities.box_ops import box_cxcywh_to_xyxy
 from scripts.rfdetr_promptable.train_promptable_fewshot import _save_query_support_figure
@@ -260,19 +261,7 @@ def main() -> None:
     segmentation = bool(cfg.get("segmentation", False))
     resolution = int(cfg.get("resolution", 280))
 
-    model_config = RFDETRBaseConfig(
-        pretrain_weights=cfg.get("pretrain_weights"),
-        resolution=resolution,
-        positional_encoding_size=int(cfg.get("positional_encoding_size", 37)),
-        num_queries=int(cfg.get("num_queries", 20)),
-        num_select=int(cfg.get("num_queries", 20)),
-        num_classes=int(cfg.get("pretrained_class_count", 90)),
-        group_detr=1,
-        two_stage=False,
-        bbox_reparam=bool(cfg.get("bbox_reparam", False)),
-        segmentation_head=segmentation,
-        device=str(device),
-    )
+    model_config = build_base_model_config(cfg, device, segmentation=segmentation)
     train_config = TrainConfig(dataset_dir=".", output_dir=str(output_dir))
     model = PCSDetector.from_config(
         model_config, train_config,

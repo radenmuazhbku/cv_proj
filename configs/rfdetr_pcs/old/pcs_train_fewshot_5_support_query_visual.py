@@ -1,11 +1,12 @@
-"""Full PCS training: two separate support images condition COCO query images."""
+"""Full multi-support PCS: support image/box tokens only, no class token."""
 
 from pathlib import Path
 
 cfg = {
     "mode": "support_query",
+    "conditioning_mode": "visual_prompt",
     "seed": 7,
-    "pretrain_weights": "rf-detr-base.pth",
+    "use_pretrained_model": True,
     "train_image_dir": Path("datasets/mscoco/train2017"),
     "train_annotation_file": Path("datasets/mscoco_prompt_split/train.json"),
     "train_support_image_dir": Path("datasets/mscoco/val2017"),
@@ -19,13 +20,15 @@ cfg = {
     "test_support_image_dir": Path("datasets/mscoco/val2017"),
     "test_support_annotation_file": Path("datasets/mscoco_prompt_split/unseen_support.json"),
     "episodes": 80_000,
-    "shots": 2,
+    "shots": 5,
     "negative_prompt_ratio": 0.0,
+    # Positive support images define the concept; an absent query class is a
+    # meaningful negative episode in this separate support/query mode.
     "negative_class_ratio": 0.1,
-    "pretrained_class_count": 90,
-    "num_prompt_classes": 91,
-    "init_class_embeddings_from_detector": True,
+    "validation_negative_class_ratio": 0.1,
+    "test_negative_class_ratio": 0.1,
     "support_loss_weight": 0.5,
+    "include_prompt_box_in_loss": True,
     "steps": 100_000,
     "batch_repeat": 1,
     "batch_size": 2,
@@ -43,8 +46,8 @@ cfg = {
     "warmup_start_factor": 0.1,
     "min_lr_ratio": 0.01,
     "clip_grad_norm": 0.1,
-    "log_every": 100,
-    "eval_every": 5_000,
+    "log_every": 1000,
+    "eval_every": 100_000,
     "validation_episodes": 2_000,
     "test_episodes": 2_000,
     "selection_metric": "matched_box_iou",
@@ -59,6 +62,6 @@ cfg = {
     "evaluate_test_at_end": True,
     "max_checkpoints": 3,
     "device": "cuda",
-    "output_dir": Path("logs/rfdetr_pcs_train_fewshot_2_support_query"),
-    "figure_dir": Path("logs/rfdetr_pcs_train_fewshot_2_support_query/figures"),
+    "output_dir": Path("logs/rfdetr_pcs_train_fewshot_5_support_query_visual"),
+    "figure_dir": Path("logs/rfdetr_pcs_train_fewshot_5_support_query_visual/figures"),
 }
