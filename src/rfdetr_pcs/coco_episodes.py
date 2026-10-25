@@ -40,6 +40,8 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
         seed: int = 7,
         training: bool = True,
         include_masks: bool = False,
+        aug_config: dict[str, Any] | None = None,
+        augmentation_backend: str = "cpu",
     ) -> None:
         if (episodes <= 0 or max_shots <= 0 or negative_ratio < 0
                 or negative_prompt_ratio < 0 or negative_class_ratio < 0
@@ -141,18 +143,85 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                     (category_id, image_id, True) for image_id in sorted(self.category_image_instances[category_id])
                 )
 
+        self.aug_config = aug_config
+        self.augmentation_backend = augmentation_backend
+        self._augmentation_pipeline = None
+        if self.aug_config and self.training:
+            self._setup_augmentation_pipeline()
+
     def __len__(self) -> int:
         return self.episodes if self.training else len(self.eval_records)
+
+    def _setup_augmentation_pipeline(self) -> None:
+        backend = self.augmentation_backend
+        if backend in ("kornia", "gpu"):
+            try:
+                import kornia.augmentation as K
+                self._augmentation_pipeline = K.AugmentationSequential(
+                    *self._build_kornia_transforms(),
+                    data_keys=["input"],
+                    random_apply=True,
+                )
+            except ImportError:
+                import warnings
+                warnings.warn(
+                    "Kornia not installed, falling back to CPU augmentation. "
+                    "Install with: pip install 'rfdetr[augment]'"
+                )
+                backend = "albumentations"
+        if backend in ("albumentations", "albu", "cpu"):
+            try:
+                import albumentations as A
+                self._augmentation_pipeline = A.Compose(self._build_albumentations_transform())
+            except ImportError:
+                import warnings
+                warnings.warn(
+                    "Albumentations not installed, falling back to torchvision. "
+                    "Install with: pip install 'rfdetr[augment]'"
+                )
+                self._augmentation_pipeline = None
+
+    def _build_albumentations_transform(self) -> list:
+        from rfdetr_pcs.datasets.transforms import AlbumentationsWrapper
+        transforms = AlbumentationsWrapper.from_config(self.aug_config or {})
+        return [t.transform for t in transforms]
+
+    def _build_kornia_transforms(self) -> list:
+        import kornia.augmentation as K
+        from rfdetr_pcs.datasets.kornia_transforms import build_kornia_pipeline
+        if self.aug_config:
+            return build_kornia_pipeline(self.aug_config, self.resolution, with_masks=self.include_masks)
+        return []
+
+    def _apply_augmentation(self, image_tensor: Tensor) -> Tensor:
+        if self._augmentation_pipeline is None or not self.training:
+            return image_tensor
+        if isinstance(self._augmentation_pipeline, type(None)):
+            return image_tensor
+        if "kornia" in str(type(self._augmentation_pipeline)):
+            import kornia.augmentation as K
+            if isinstance(image_tensor, Tensor):
+                image_tensor = image_tensor.unsqueeze(0)
+                augmented = self._augmentation_pipeline(image_tensor)
+                return augmented.squeeze(0)
+        else:
+            import numpy as np
+            image_np = image_tensor.detach().cpu().numpy().transpose(1, 2, 0)
+            augmented = self._augmentation_pipeline(image=image_np)
+            return torch.from_numpy(augmented["image"].transpose(2, 0, 1)).float().to(image_tensor.device)
 
     def _load_tensor(
         self, image_id: int, support: bool = False
     ) -> tuple[Tensor, int, int]:
-        coco = self.support_coco if support else self.coco
+        # coco = self.support_coco if support else self.coco
         metadata = coco.loadImgs([image_id])[0]
         image_root = self.support_image_dir if support else self.image_dir
         image = Image.open(image_root / metadata["file_name"]).convert("RGB")
         width, height = image.size
         tensor = TF.resize(TF.to_tensor(image), [self.resolution, self.resolution])
+        # if not support and self.training and self.aug_config:
+        # if self.training and self.aug_config:
+        tensor = self._apply_augmentation(tensor)
         return tensor, width, height
 
     @staticmethod

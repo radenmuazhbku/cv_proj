@@ -35,6 +35,13 @@ from rfdetr_pcs.coco_episodes import (  # noqa: E402
     collate_support_query,
 )
 from rfdetr_pcs.config import TrainConfig  # noqa: E402
+from rfdetr_pcs.datasets.aug_configs import (  # noqa: E402
+    AUG_CONFIG,
+    AUG_CONSERVATIVE,
+    AUG_AGGRESSIVE,
+    AUG_AERIAL,
+    AUG_INDUSTRIAL,
+)
 from rfdetr_pcs.model_presets import build_base_model_config  # noqa: E402
 from rfdetr_pcs.conditioning import (  # noqa: E402
     class_ids_for_mode, conditioning_mode_at, conditioning_schedule, uses_class_embeddings,
@@ -72,6 +79,126 @@ def _jsonable(value: Any) -> Any:
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
             for key, value in batch.items()}
+
+
+def _apply_gpu_augmentation(
+    batch: dict[str, Any], cfg: dict[str, Any], device: torch.device
+) -> dict[str, Any]:
+    """Apply GPU augmentation (Kornia) to batch images.
+
+    Applies Kornia-based GPU augmentation to query and support images in the batch.
+    Follows the pattern from RFDETRDataModule.on_after_batch_transfer().
+
+    Args:
+        batch: Dictionary containing batch tensors on device.
+        cfg: Training configuration with augmentation settings.
+        device: Target device for augmentation.
+
+    Returns:
+        Batch with augmented images and updated targets.
+    """
+    try:
+        from rfdetr_pcs.datasets.kornia_transforms import (
+            build_kornia_pipeline, build_normalize,
+            require_gpu_backend_ready, is_gpu_postprocess,
+        )
+    except ImportError as e:
+        import warnings
+        warnings.warn(f"Kornia GPU augmentation not available: {e}. Skipping GPU augmentation.")
+        return batch
+
+    augmentation_backend = str(cfg.get("augmentation_backend", "cpu"))
+    
+    if not is_gpu_postprocess(augmentation_backend):
+        return batch
+    
+    try:
+        require_gpu_backend_ready(augmentation_backend, has_cuda=torch.cuda.is_available())
+    except (ImportError, RuntimeError) as e:
+        import warnings
+        warnings.warn(f"Kornia GPU augmentation requirements not met: {e}. Skipping.")
+        return batch
+
+    aug_config = cfg.get("aug_config", None)
+    if aug_config is None:
+        aug_config = AUG_CONFIG
+    
+    resolution = int(cfg.get("resolution", 560))
+    include_masks = bool(cfg.get("segmentation", True))
+    
+    kornia_pipeline = build_kornia_pipeline(aug_config, resolution, with_masks=include_masks)
+    kornia_normalize = build_normalize()
+    
+    kornia_pipeline.to(device)
+    kornia_normalize.to(device)
+
+    if "query_images" in batch:
+        images = batch["query_images"]
+        boxes = batch.get("query_boxes")
+        padding_mask = batch.get("query_padding_mask")
+        masks = batch.get("query_masks") if include_masks else None
+        
+        batch["query_images"] = _apply_kornia_to_batch(
+            images, boxes, masks, padding_mask, kornia_pipeline, kornia_normalize, device
+        )
+    
+    if "support_images" in batch:
+        images = batch["support_images"]
+        boxes = batch.get("support_boxes")
+        padding_mask = batch.get("support_padding_mask")
+        masks = batch.get("support_masks") if include_masks else None
+        
+        batch["support_images"] = _apply_kornia_to_batch(
+            images, boxes, masks, padding_mask, kornia_pipeline, kornia_normalize, device
+        )
+
+    return batch
+
+
+def _apply_kornia_to_batch(
+    images: torch.Tensor,
+    boxes: torch.Tensor | None,
+    masks: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    pipeline: Any,
+    normalize: Any,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply Kornia pipeline to a batch of images.
+
+    Args:
+        images: Batch of images tensor [B, C, H, W] on device.
+        boxes: Batch of boxes tensor or None.
+        masks: Batch of masks tensor or None.
+        padding_mask: Padding mask tensor or None.
+        pipeline: Kornia augmentation pipeline.
+        normalize: Kornia normalization function.
+        device: Target device.
+
+    Returns:
+        Augmented images tensor.
+    """
+    if images.shape[0] == 0:
+        return images
+
+    b, c, h, w = images.shape
+    
+    if padding_mask is None:
+        padding_mask = torch.zeros(b, h, w, dtype=torch.bool, device=device)
+    padding_masks = padding_mask.unsqueeze(1).to(torch.float32)
+
+    if masks is not None and masks.numel() > 0:
+        image_height, image_width = h, w
+        auxiliary_masks = torch.cat((masks, padding_masks), dim=1)
+        img_aug, boxes_aug, auxiliary_masks_aug = pipeline(images, boxes, auxiliary_masks)
+        padding_mask_aug = auxiliary_masks_aug[:, masks.shape[1]:] > 0.5
+    else:
+        img_aug, boxes_aug, padding_masks_aug = pipeline(images, boxes, padding_masks)
+        padding_mask_aug = padding_masks_aug[:, 0] > 0.5 if padding_masks_aug is not None else None
+
+    img_aug = normalize(img_aug)
+    
+    return img_aug
 
 
 def _class_ids(batch: dict[str, Any], device: torch.device) -> torch.Tensor:
@@ -153,6 +280,9 @@ def _weighted_loss(model: PCSDetector, losses: dict[str, torch.Tensor]) -> torch
 def _build_datasets(cfg: dict[str, Any], mode: str) -> tuple[CocoFewShotEpisodeDataset, ...]:
     resolution = int(cfg["resolution"])
     shots = int(cfg.get("shots", cfg.get("max_prompt_boxes", 1)))
+    aug_config = cfg.get("aug_config", None)
+    if aug_config is None and bool(cfg.get("use_default_augmentation", True)):
+        aug_config = AUG_CONFIG
     common = {
         "resolution": resolution,
         "max_shots": shots,
@@ -161,6 +291,8 @@ def _build_datasets(cfg: dict[str, Any], mode: str) -> tuple[CocoFewShotEpisodeD
         "negative_class_ratio": float(cfg.get("negative_class_ratio", 0.0)),
         "seed": int(cfg.get("seed", 7)),
         "include_masks": bool(cfg.get("segmentation", True)),
+        "aug_config": aug_config,
+        "augmentation_backend": str(cfg.get("augmentation_backend", "cpu")),
     }
     separate = mode == "support_query"
 
@@ -182,6 +314,8 @@ def _build_datasets(cfg: dict[str, Any], mode: str) -> tuple[CocoFewShotEpisodeD
         if not training:
             options["negative_ratio"] = 0.0
             options["negative_class_ratio"] = float(cfg.get(f"{split}_negative_class_ratio", 0.0))
+            options["aug_config"] = None
+            options["augmentation_backend"] = "cpu"
         return CocoFewShotEpisodeDataset(image_dir, annotation_file, **kwargs, **options)
 
     return create("train", True), create("validation", False, 1), create("test", False, 2)
@@ -492,12 +626,69 @@ def _lr_at(cfg: dict[str, Any], step: int, total_steps: int) -> float:
 def _save_curves(records: list[dict[str, Any]], output_dir: Path) -> None:
     if not records:
         return
+
+    # ── CSV export ──────────────────────────────────────────────────────
     columns = list(dict.fromkeys(key for row in records for key in row))
     with (output_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(records)
+
+    vis_dir = output_dir / "visualizations"
+    vis_dir.mkdir(exist_ok=True)
     steps = [row["step"] for row in records]
+
+    # Helper: extract a metric series, return None if entirely missing.
+    def _series(key: str) -> list[float] | None:
+        vals = [row.get(key) for row in records]
+        if all(v is None for v in vals):
+            return None
+        return [float(v) if v is not None else float("nan") for v in vals]
+
+    # Style constants matching the reference RF-DETR visualizations.
+    COLORS = {
+        "train_loss": "#1f77b4",
+        "validation_loss": "#ff7f0e",
+        "box_iou": "#2ca02c",
+        "mask_iou": "#d62728",
+        # mAP colours
+        "bbox_mAP": "#ff7f0e",
+        "bbox_mAP_50": "#ff7f0e",
+        "bbox_mAP_75": "#8c564b",
+        "bbox_novel_mAP": "#2ca02c",
+        "bbox_novel_mAP_50": "#2ca02c",
+        "bbox_novel_mAP_75": "#17becf",
+        "bbox_base_mAP": "#9467bd",
+        "bbox_base_mAP_50": "#9467bd",
+        "bbox_base_mAP_75": "#7f7f7f",
+        "segm_mAP": "#ff7f0e",
+        "segm_mAP_50": "#ff7f0e",
+        "segm_mAP_75": "#8c564b",
+        "segm_novel_mAP": "#2ca02c",
+        "segm_novel_mAP_50": "#2ca02c",
+        "segm_novel_mAP_75": "#17becf",
+        "segm_base_mAP": "#9467bd",
+        "segm_base_mAP_50": "#9467bd",
+        "segm_base_mAP_75": "#7f7f7f",
+    }
+
+    # ── 1. Loss metrics  ───────────────────────────────────────────────
+    fig_loss, ax_loss = plt.subplots(figsize=(12, 4.5))
+    for key, label in [("train_loss", "train/loss"), ("validation_loss", "val/loss")]:
+        s = _series(key)
+        if s is not None:
+            ax_loss.plot(steps, s, label=label, color=COLORS.get(key))
+    ax_loss.set_xlabel("Optimizer step")
+    ax_loss.set_ylabel("Loss")
+    ax_loss.set_title("Loss", fontweight="bold")
+    ax_loss.grid(True, alpha=0.25)
+    ax_loss.legend(loc="upper right")
+    fig_loss.suptitle("RF-DETR PCS Loss Metrics", fontsize=14, fontweight="bold")
+    fig_loss.tight_layout()
+    fig_loss.savefig(vis_dir / "loss_metrics.png", dpi=140)
+    plt.close(fig_loss)
+
+    # ── 2. Training curves (loss + IoU)  ───────────────────────────────
     fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
     axes[0].plot(steps, [row.get("train_loss", float("nan")) for row in records], label="train loss")
     axes[0].plot(steps, [row.get("validation_loss", float("nan")) for row in records], label="validation loss")
@@ -515,6 +706,139 @@ def _save_curves(records: list[dict[str, Any]], output_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(output_dir / "training_curves.png", dpi=140)
     plt.close(fig)
+
+    # ── 3. COCOeval mAP metrics  ───────────────────────────────────────
+    # Determine which iou_types actually have data.
+    has_bbox = _series("bbox_mAP_50") is not None
+    has_segm = _series("segm_mAP_50") is not None
+    if not has_bbox and not has_segm:
+        return  # No COCOeval metrics recorded yet.
+
+    iou_types_present = []
+    if has_bbox:
+        iou_types_present.append("bbox")
+    if has_segm:
+        iou_types_present.append("segm")
+
+    n_types = len(iou_types_present)
+
+    # Detection mAP figure: 2 rows (mAP@50 / novel-base; mAP@50:95 / mAP@75)
+    fig_map, axes_map = plt.subplots(2, n_types, figsize=(7 * n_types, 8), squeeze=False)
+
+    for col, iou_type in enumerate(iou_types_present):
+        type_label = "BBox" if iou_type == "bbox" else "Segm"
+
+        # ── Row 0: mAP@0.50 (all, novel, base) ─────────────────────
+        ax = axes_map[0, col]
+        for key, label, ls in [
+            (f"{iou_type}_mAP_50", f"val/{type_label} mAP@50", "-"),
+            (f"{iou_type}_novel_mAP_50", f"val/{type_label} novel mAP@50", "--"),
+            (f"{iou_type}_base_mAP_50", f"val/{type_label} base mAP@50", "-."),
+        ]:
+            s = _series(key)
+            if s is not None:
+                ax.plot(steps, s, label=label, linestyle=ls, color=COLORS.get(key))
+        ax.set_title(f"{type_label} Detection AP@0.50", fontweight="bold")
+        ax.set_ylabel("mAP")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+
+        # ── Row 1: mAP@50:95 and mAP@75 ───────────────────────────
+        ax2 = axes_map[1, col]
+        for key, label, ls in [
+            (f"{iou_type}_mAP", f"val/{type_label} mAP@50:95", "-"),
+            (f"{iou_type}_mAP_75", f"val/{type_label} mAP@75", "--"),
+            (f"{iou_type}_novel_mAP", f"val/{type_label} novel mAP@50:95", ":"),
+            (f"{iou_type}_novel_mAP_75", f"val/{type_label} novel mAP@75", "-."),
+            (f"{iou_type}_base_mAP", f"val/{type_label} base mAP@50:95", (0, (5, 5))),
+            (f"{iou_type}_base_mAP_75", f"val/{type_label} base mAP@75", (0, (5, 3, 1, 3))),
+        ]:
+            s = _series(key)
+            if s is not None:
+                ax2.plot(steps, s, label=label, linestyle=ls, color=COLORS.get(key))
+        ax2.set_title(f"{type_label} Detection AP@[50:95, 75]", fontweight="bold")
+        ax2.set_xlabel("Optimizer step")
+        ax2.set_ylabel("mAP")
+        ax2.grid(True, alpha=0.25)
+        ax2.legend(fontsize=8)
+
+    fig_map.suptitle("RF-DETR PCS mAP Metrics", fontsize=14, fontweight="bold")
+    fig_map.tight_layout()
+    fig_map.savefig(vis_dir / "map_metrics.png", dpi=140)
+    plt.close(fig_map)
+
+    # ── 4. Combined training_metrics (reference-style 6-panel) ─────
+    n_panels = 2 + (2 * n_types)  # loss, IoU, + 2 per iou_type
+    n_cols_grid = 2
+    n_rows_grid = math.ceil(n_panels / n_cols_grid)
+    fig_all, ax_all = plt.subplots(n_rows_grid, n_cols_grid, figsize=(14, 4.5 * n_rows_grid))
+    ax_flat = ax_all.flatten()
+    panel = 0
+
+    # Panel: Loss
+    ax_flat[panel].plot(steps, [row.get("train_loss", float("nan")) for row in records], label="train/loss", linestyle=":", color="#1f77b4")
+    ax_flat[panel].plot(steps, [row.get("validation_loss", float("nan")) for row in records], label="val/loss", color="#ff7f0e")
+    ax_flat[panel].set_title("Loss", fontweight="bold")
+    ax_flat[panel].set_ylabel("Loss")
+    ax_flat[panel].grid(True, alpha=0.25)
+    ax_flat[panel].legend(fontsize=8)
+    panel += 1
+
+    # Panel: IoU
+    ax_flat[panel].plot(steps, [row.get("validation_box_iou", float("nan")) for row in records], label="val/box_IoU", color="#2ca02c")
+    s_mask = _series("validation_mask_iou")
+    if s_mask is not None:
+        ax_flat[panel].plot(steps, s_mask, label="val/mask_IoU", color="#d62728")
+    ax_flat[panel].set_title("Matched IoU", fontweight="bold")
+    ax_flat[panel].set_ylabel("IoU")
+    ax_flat[panel].set_ylim(0, 1)
+    ax_flat[panel].grid(True, alpha=0.25)
+    ax_flat[panel].legend(fontsize=8)
+    panel += 1
+
+    # Panels per iou_type: mAP@50 and mAP@50:95
+    for iou_type in iou_types_present:
+        type_label = "BBox" if iou_type == "bbox" else "Segm"
+
+        ax_cur = ax_flat[panel]
+        for key, label, ls in [
+            (f"{iou_type}_mAP_50", f"val/{type_label} mAP@50", "-"),
+            (f"{iou_type}_novel_mAP_50", f"val/{type_label} novel mAP@50", "--"),
+            (f"{iou_type}_base_mAP_50", f"val/{type_label} base mAP@50", "-."),
+        ]:
+            s = _series(key)
+            if s is not None:
+                ax_cur.plot(steps, s, label=label, linestyle=ls)
+        ax_cur.set_title(f"{type_label} Detection AP@0.50", fontweight="bold")
+        ax_cur.set_ylabel("Detection AP@0.50")
+        ax_cur.grid(True, alpha=0.25)
+        ax_cur.legend(fontsize=7)
+        panel += 1
+
+        ax_cur2 = ax_flat[panel]
+        for key, label, ls in [
+            (f"{iou_type}_mAP", f"val/{type_label} mAP@50:95", "-"),
+            (f"{iou_type}_novel_mAP", f"val/{type_label} novel mAP@50:95", "--"),
+            (f"{iou_type}_base_mAP", f"val/{type_label} base mAP@50:95", "-."),
+        ]:
+            s = _series(key)
+            if s is not None:
+                ax_cur2.plot(steps, s, label=label, linestyle=ls)
+        ax_cur2.set_title(f"{type_label} Detection AP@0.50:0.95", fontweight="bold")
+        ax_cur2.set_xlabel("Optimizer step")
+        ax_cur2.set_ylabel("Detection AP@0.50:0.95")
+        ax_cur2.grid(True, alpha=0.25)
+        ax_cur2.legend(fontsize=7)
+        panel += 1
+
+    # Hide any unused panels
+    for idx in range(panel, len(ax_flat)):
+        ax_flat[idx].set_visible(False)
+
+    fig_all.suptitle("RF-DETR PCS Training Metrics", fontsize=14, fontweight="bold")
+    fig_all.tight_layout()
+    fig_all.savefig(vis_dir / "training_metrics.png", dpi=140)
+    plt.close(fig_all)
 
 
 def _save_checkpoint(
@@ -684,6 +1008,8 @@ def main() -> None:
                 raw_batch = next(loader_iter)
             current_batch = _move_batch(raw_batch, device)
         batch = current_batch
+        if bool(cfg.get("use_gpu_augmentation", False)):
+            batch = _apply_gpu_augmentation(batch, cfg, device)
         if mode == "same_image":
             output = model(
                 batch["query_images"], batch["support_boxes"],
@@ -789,6 +1115,19 @@ def main() -> None:
                 "validation_mask_iou": val_result.get("matched_mask_iou"),
                 "train_sanity_box_iou": sanity_result.get("matched_box_iou") if sanity_result else None,
             }
+            # Capture COCOeval metrics for curve plots
+            for coco_key in (
+                "bbox_mAP", "bbox_mAP_50", "bbox_mAP_75",
+                "bbox_mAP_s", "bbox_mAP_m", "bbox_mAP_l",
+                "bbox_novel_mAP", "bbox_novel_mAP_50", "bbox_novel_mAP_75",
+                "bbox_base_mAP", "bbox_base_mAP_50", "bbox_base_mAP_75",
+                "segm_mAP", "segm_mAP_50", "segm_mAP_75",
+                "segm_mAP_s", "segm_mAP_m", "segm_mAP_l",
+                "segm_novel_mAP", "segm_novel_mAP_50", "segm_novel_mAP_75",
+                "segm_base_mAP", "segm_base_mAP_50", "segm_base_mAP_75",
+            ):
+                if coco_key in val_result:
+                    curve_record[coco_key] = val_result[coco_key]
             curve_records.append(curve_record)
             metrics_path.write_text(json.dumps({
                 "config": _jsonable(cfg), "evaluations": evaluations,

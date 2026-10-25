@@ -1,16 +1,37 @@
 """Full FSOD Training (MS COCO, 5-shot): standard 200k-step compute budget."""
 
 from pathlib import Path
+AUG_AGGRESSIVE = {
+    "HorizontalFlip": {"p": 0.5},
+    "VerticalFlip": {"p": 0.5},
+    "Rotate": {"limit": 45, "p": 0.5},
+    "Affine": {
+        "scale": (0.8, 1.2),
+        "translate_percent": (-0.1, 0.1),
+        "rotate": (-15, 15),
+        "shear": (-5, 5),
+        "p": 0.5,
+    },
+    "ColorJitter": {
+        "brightness": 0.2,
+        "contrast": 0.2,
+        "saturation": 0.2,
+        # "hue": "abc",
+        "hue": 0.1,
+        "p": 0.5,
+    },
+}
 
 cfg = {
+    "aug_config": AUG_AGGRESSIVE,
     "mode": "support_query",
     "conditioning_mode": "visual_prompt",
     "conditioning_schedule": [
         {"mode": "class_embedding", "steps": 100_000},
-        {"mode": "visual_prompt", "steps": 300_000},
+        {"mode": "visual_prompt", "steps": 800_000},
     ],
-    "steps": 400_000,
-    "eval_every": 25_000,
+    "steps": 1_000_000,
+    "eval_every": 100_000,
     "log_every": 10_000,
     "seed": 7,
     "use_pretrained_model": False,
@@ -29,7 +50,7 @@ cfg = {
     "test_annotation_file": Path("datasets/mscoco_fsod_splits/coco_val_full.json"),
     "test_support_image_dir": Path("datasets/mscoco/train2017"),
     "test_support_annotation_file": Path("datasets/mscoco_fsod_splits/coco_fsod_novel_5shot_seed0.json"),
-    "episodes": 80_000,
+    "episodes": 200_000,
     "shots": 5,
     "negative_prompt_ratio": 0.0,
     "negative_class_ratio": 0.1,
@@ -59,7 +80,8 @@ cfg = {
     # Standard 20 COCO Novel category IDs:
     "novel_category_ids": [1, 2, 3, 4, 5, 6, 7, 9, 16, 17, 18, 19, 20, 21, 44, 62, 63, 64, 67, 72],
     "selection_metric": "matched_box_iou",
-    "train_sanity": False,
+    "train_sanity": True,
+    "train_sanity_samples": 8,
     "validation_sanity": True,
     "validation_sanity_samples": 8,
     "test_sanity": True,
