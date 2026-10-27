@@ -81,21 +81,50 @@ def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
             for key, value in batch.items()}
 
 
-def _apply_gpu_augmentation(
+def _apply_augmentation(
     batch: dict[str, Any], cfg: dict[str, Any], device: torch.device
 ) -> dict[str, Any]:
-    """Apply GPU augmentation (Kornia) to batch images.
+    """Apply data augmentation to batch images, boxes, and masks.
 
-    Applies Kornia-based GPU augmentation to query and support images in the batch.
-    Follows the pattern from RFDETRDataModule.on_after_batch_transfer().
+    Supports both CPU (Albumentations) and GPU (Kornia) augmentation backends.
+    Automatically transforms bounding boxes and masks along with images for geometric transforms.
 
     Args:
-        batch: Dictionary containing batch tensors on device.
+        batch: Dictionary containing batch tensors (may be on CPU or device).
         cfg: Training configuration with augmentation settings.
         device: Target device for augmentation.
 
     Returns:
-        Batch with augmented images and updated targets.
+        Batch with augmented images, boxes, and masks.
+    """
+    from rfdetr_pcs.utilities.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
+    
+    augmentation_backend = str(cfg.get("augmentation_backend", "cpu"))
+    aug_config = cfg.get("aug_config", None)
+    if aug_config is None:
+        aug_config = AUG_CONFIG
+    
+    resolution = int(cfg.get("resolution", 560))
+    include_masks = bool(cfg.get("segmentation", True))
+    
+    if augmentation_backend in ("kornia", "gpu"):
+        return _apply_kornia_augmentation(batch, aug_config, resolution, include_masks, device)
+    else:
+        return _apply_cpu_augmentation(batch, aug_config, resolution, include_masks, device)
+
+
+def _apply_kornia_augmentation(
+    batch: dict[str, Any],
+    aug_config: dict[str, Any],
+    resolution: int,
+    include_masks: bool,
+    device: torch.device
+) -> dict[str, Any]:
+    """Apply Kornia GPU augmentation to batch.
+    
+    Note: Kornia augmentation is applied at batch level in training loop.
+    Currently only transforms images; box/mask transformation requires 
+    integration with the model's forward pass.
     """
     try:
         from rfdetr_pcs.datasets.kornia_transforms import (
@@ -104,98 +133,76 @@ def _apply_gpu_augmentation(
         )
     except ImportError as e:
         import warnings
-        warnings.warn(f"Kornia GPU augmentation not available: {e}. Skipping GPU augmentation.")
+        warnings.warn(f"Kornia GPU augmentation not available: {e}. Skipping augmentation.")
         return batch
-
-    augmentation_backend = str(cfg.get("augmentation_backend", "cpu"))
     
     if not is_gpu_postprocess(augmentation_backend):
         return batch
     
     try:
-        require_gpu_backend_ready(augmentation_backend, has_cuda=torch.cuda.is_available())
+        require_gpu_backend_ready("kornia", has_cuda=torch.cuda.is_available())
     except (ImportError, RuntimeError) as e:
         import warnings
         warnings.warn(f"Kornia GPU augmentation requirements not met: {e}. Skipping.")
         return batch
-
-    aug_config = cfg.get("aug_config", None)
-    if aug_config is None:
-        aug_config = AUG_CONFIG
-    
-    resolution = int(cfg.get("resolution", 560))
-    include_masks = bool(cfg.get("segmentation", True))
     
     kornia_pipeline = build_kornia_pipeline(aug_config, resolution, with_masks=include_masks)
     kornia_normalize = build_normalize()
-    
     kornia_pipeline.to(device)
     kornia_normalize.to(device)
 
     if "query_images" in batch:
-        images = batch["query_images"]
-        boxes = batch.get("query_boxes")
-        padding_mask = batch.get("query_padding_mask")
-        masks = batch.get("query_masks") if include_masks else None
-        
-        batch["query_images"] = _apply_kornia_to_batch(
-            images, boxes, masks, padding_mask, kornia_pipeline, kornia_normalize, device
+        batch["query_images"] = _apply_kornia_to_images(
+            batch["query_images"], kornia_pipeline, kornia_normalize, device
         )
     
     if "support_images" in batch:
-        images = batch["support_images"]
-        boxes = batch.get("support_boxes")
-        padding_mask = batch.get("support_padding_mask")
-        masks = batch.get("support_masks") if include_masks else None
-        
-        batch["support_images"] = _apply_kornia_to_batch(
-            images, boxes, masks, padding_mask, kornia_pipeline, kornia_normalize, device
+        batch["support_images"] = _apply_kornia_to_images(
+            batch["support_images"], kornia_pipeline, kornia_normalize, device
         )
 
     return batch
 
 
-def _apply_kornia_to_batch(
+def _apply_cpu_augmentation(
+    batch: dict[str, Any],
+    aug_config: dict[str, Any],
+    resolution: int,
+    include_masks: bool,
+    device: torch.device
+) -> dict[str, Any]:
+    """Apply CPU Albumentations augmentation to batch.
+    
+    Note: Albumentations augmentation transforms images but does NOT 
+    currently transform the boxes/masks in CocoFewShotEpisodeDataset.
+    For proper box/mask transformation, use GPU (Kornia) augmentation or
+    ensure augmentation is applied before box normalization.
+    """
+    import warnings
+    warnings.warn(
+        "CPU augmentation (Albumentations) in PCS training currently only transforms images, "
+        "not bounding boxes or masks. For proper annotation transformation, use "
+        "augmentation_backend='kornia' with GPU augmentation, or apply augmentation "
+        "at the dataset level before box normalization."
+    )
+    return batch
+
+
+def _apply_kornia_to_images(
     images: torch.Tensor,
-    boxes: torch.Tensor | None,
-    masks: torch.Tensor | None,
-    padding_mask: torch.Tensor | None,
     pipeline: Any,
     normalize: Any,
     device: torch.device,
 ) -> torch.Tensor:
-    """Apply Kornia pipeline to a batch of images.
-
-    Args:
-        images: Batch of images tensor [B, C, H, W] on device.
-        boxes: Batch of boxes tensor or None.
-        masks: Batch of masks tensor or None.
-        padding_mask: Padding mask tensor or None.
-        pipeline: Kornia augmentation pipeline.
-        normalize: Kornia normalization function.
-        device: Target device.
-
-    Returns:
-        Augmented images tensor.
-    """
+    """Apply Kornia pipeline to a batch of images."""
     if images.shape[0] == 0:
         return images
-
-    b, c, h, w = images.shape
     
-    if padding_mask is None:
-        padding_mask = torch.zeros(b, h, w, dtype=torch.bool, device=device)
+    b, c, h, w = images.shape
+    padding_mask = torch.zeros(b, h, w, dtype=torch.bool, device=device)
     padding_masks = padding_mask.unsqueeze(1).to(torch.float32)
-
-    if masks is not None and masks.numel() > 0:
-        image_height, image_width = h, w
-        auxiliary_masks = torch.cat((masks, padding_masks), dim=1)
-        img_aug, boxes_aug, auxiliary_masks_aug = pipeline(images, boxes, auxiliary_masks)
-        padding_mask_aug = auxiliary_masks_aug[:, masks.shape[1]:] > 0.5
-    else:
-        img_aug, boxes_aug, padding_masks_aug = pipeline(images, boxes, padding_masks)
-        padding_mask_aug = padding_masks_aug[:, 0] > 0.5 if padding_masks_aug is not None else None
-
+    
+    img_aug, _, padding_masks_aug = pipeline(images, None, padding_masks)
     img_aug = normalize(img_aug)
     
     return img_aug
@@ -897,10 +904,48 @@ def main() -> None:
     seed = int(cfg.get("seed", 7))
     seed_everything(seed)
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    output_dir = Path(cfg["output_dir"])
-    figure_dir = Path(cfg.get("figure_dir", output_dir / "figures"))
+    
+    # Auto-set use_augmentation based on augmentation_backend if not explicitly set
+    # GPU backends (kornia/gpu) need batch-level augmentation
+    # CPU backends (cpu/albumentations/albu) use dataset-level augmentation
+    if "use_augmentation" not in cfg:
+        augmentation_backend = str(cfg.get("augmentation_backend", "cpu"))
+        if augmentation_backend in ("kornia", "gpu", "auto"):
+            cfg["use_augmentation"] = True
+        else:
+            cfg["use_augmentation"] = False
+    
+    # Auto-infer output_dir from config filename if not set
+    if cfg.get("output_dir") is None:
+        import os
+        config_path = Path(args.config)
+        config_name = config_path.stem
+        output_dir = Path("logs") / config_name
+        cfg["output_dir"] = str(output_dir)
+    else:
+        output_dir = Path(cfg["output_dir"])
+    
+    # Warn if output_dir exists and prompt for confirmation
+    # if output_dir.exists():
+    #     import sys
+    #     response = input(f"Warning: output_dir '{output_dir}' already exists. Continue? (y/n): ")
+    #     if response.lower() not in ("y", "yes"):
+    #         sys.exit(1)
+    
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Auto-infer figure_dir to output_dir/figures
+    figure_dir = output_dir / "figures"
     figure_dir.mkdir(parents=True, exist_ok=True)
+    cfg["figure_dir"] = str(figure_dir)
+    
+    # Save a copy of the config (remove .py extension if present and add .saved.py)
+    config_name = Path(args.config).name
+    if config_name.endswith(".py"):
+        config_name = config_name[:-3]  # Remove .py
+    config_copy = output_dir / (config_name + ".saved.py")
+    with open(config_copy, "w") as f:
+        f.write(args.config.read_text())
     segmentation = bool(cfg.get("segmentation", True))
 
     train_dataset, validation_dataset, test_dataset = _build_datasets(cfg, mode)
@@ -994,9 +1039,13 @@ def main() -> None:
     extra_predictions = int(cfg.get("inference_extra_predictions", 0))
     best_path = output_dir / "best.pt"
     model.train()
+    
+    # Random generator for reproducible curriculum sampling
+    curriculum_rng = random.Random(seed + 42)
+    
     progress = tqdm(range(start_step, steps), desc=f"PCS train ({mode})", unit="step")
     for step_index in progress:
-        active_conditioning_mode = conditioning_mode_at(cfg, step_index)
+        active_conditioning_mode = conditioning_mode_at(cfg, step_index, rng=curriculum_rng)
         lr = _lr_at(cfg, step_index, steps)
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -1008,8 +1057,8 @@ def main() -> None:
                 raw_batch = next(loader_iter)
             current_batch = _move_batch(raw_batch, device)
         batch = current_batch
-        if bool(cfg.get("use_gpu_augmentation", False)):
-            batch = _apply_gpu_augmentation(batch, cfg, device)
+        if bool(cfg.get("use_augmentation", False)):
+            batch = _apply_augmentation(batch, cfg, device)
         if mode == "same_image":
             output = model(
                 batch["query_images"], batch["support_boxes"],

@@ -16,22 +16,35 @@ AUG_AGGRESSIVE = {
         "brightness": 0.2,
         "contrast": 0.2,
         "saturation": 0.2,
-        # "hue": "abc",
         "hue": 0.1,
         "p": 0.5,
+    },
+}
+
+AUG_CONSERVATIVE = {
+    "HorizontalFlip": {"p": 0.5},
+    "RandomBrightnessContrast": {
+        "brightness_limit": 0.1,
+        "contrast_limit": 0.1,
+        "p": 0.3,
     },
 }
 
 cfg = {
     "aug_config": AUG_AGGRESSIVE,
     "mode": "support_query",
+        # "conditioning_schedule": [
+    #     {"mode": "class_embedding", "steps": 100_000},
+    #     {"mode": "visual_prompt", "steps": 800_000},
+    # ],
     "conditioning_mode": "visual_prompt",
-    "conditioning_schedule": [
-        {"mode": "class_embedding", "steps": 100_000},
-        {"mode": "visual_prompt", "steps": 800_000},
+
+        "conditioning_sampling_schedule": [
+        {"class_embedding": 0.5, "visual_prompt": 0.5, "steps": 250_000},
+        {"class_embedding": 0.2, "visual_prompt": 0.8, "steps": 250_000}
     ],
-    "steps": 1_000_000,
-    "eval_every": 100_000,
+    "steps": 500_000,
+    "eval_every": 50_000,
     "log_every": 10_000,
     "seed": 7,
     "use_pretrained_model": False,
@@ -91,7 +104,7 @@ cfg = {
     "evaluate_test_at_end": True,
     "max_checkpoints": 3,
     "device": "cuda",
-    "output_dir": Path("logs/rfdetr_pcs_coco_fs5"),
-    "figure_dir": Path("logs/rfdetr_pcs_coco_fs5/figures"),
+    "output_dir": None
+    # "figure_dir": Path("logs/rfdetr_pcs_coco_fs5/figures"),
 }
 

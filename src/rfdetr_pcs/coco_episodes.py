@@ -213,7 +213,7 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
     def _load_tensor(
         self, image_id: int, support: bool = False
     ) -> tuple[Tensor, int, int]:
-        # coco = self.support_coco if support else self.coco
+        coco = self.support_coco if support else self.coco
         metadata = coco.loadImgs([image_id])[0]
         image_root = self.support_image_dir if support else self.image_dir
         image = Image.open(image_root / metadata["file_name"]).convert("RGB")
