@@ -31,7 +31,7 @@ AUG_CONSERVATIVE = {
 }
 
 cfg = {
-    "aug_config": AUG_AGGRESSIVE,
+    "aug_config": AUG_CONSERVATIVE,
     "mode": "support_query",
         # "conditioning_schedule": [
     #     {"mode": "class_embedding", "steps": 100_000},

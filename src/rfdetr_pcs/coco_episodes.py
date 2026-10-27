@@ -146,69 +146,137 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
         self.aug_config = aug_config
         self.augmentation_backend = augmentation_backend
         self._augmentation_pipeline = None
-        if self.aug_config and self.training:
-            self._setup_augmentation_pipeline()
+        self._augmentation_transform = None
+        if aug_config and training and augmentation_backend in ("cpu", "albumentations", "albu"):
+            self._setup_albumentations_transform()
 
     def __len__(self) -> int:
         return self.episodes if self.training else len(self.eval_records)
 
-    def _setup_augmentation_pipeline(self) -> None:
-        backend = self.augmentation_backend
-        if backend in ("kornia", "gpu"):
-            try:
-                import kornia.augmentation as K
-                self._augmentation_pipeline = K.AugmentationSequential(
-                    *self._build_kornia_transforms(),
-                    data_keys=["input"],
-                    random_apply=True,
-                )
-            except ImportError:
-                import warnings
-                warnings.warn(
-                    "Kornia not installed, falling back to CPU augmentation. "
-                    "Install with: pip install 'rfdetr[augment]'"
-                )
-                backend = "albumentations"
-        if backend in ("albumentations", "albu", "cpu"):
-            try:
-                import albumentations as A
-                self._augmentation_pipeline = A.Compose(self._build_albumentations_transform())
-            except ImportError:
-                import warnings
-                warnings.warn(
-                    "Albumentations not installed, falling back to torchvision. "
-                    "Install with: pip install 'rfdetr[augment]'"
-                )
-                self._augmentation_pipeline = None
-
-    def _build_albumentations_transform(self) -> list:
-        from rfdetr_pcs.datasets.transforms import AlbumentationsWrapper
-        transforms = AlbumentationsWrapper.from_config(self.aug_config or {})
-        return [t.transform for t in transforms]
-
-    def _build_kornia_transforms(self) -> list:
-        import kornia.augmentation as K
-        from rfdetr_pcs.datasets.kornia_transforms import build_kornia_pipeline
+    def _setup_albumentations_transform(self) -> None:
+        """Build Albumentations transform for image + bbox + mask augmentation."""
+        try:
+            import albumentations as A
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "Albumentations not installed. Install with: pip install 'rfdetr[augment]'"
+            )
+            return
+        
+        transforms_list = []
         if self.aug_config:
-            return build_kornia_pipeline(self.aug_config, self.resolution, with_masks=self.include_masks)
-        return []
+            for name, params in self.aug_config.items():
+                transform_class = getattr(A, name, None)
+                if transform_class is None:
+                    import warnings
+                    warnings.warn(f"Unknown Albumentations transform: {name}")
+                    continue
+                transforms_list.append(transform_class(**params))
+        
+        # In Albumentations 2.x, masks are handled automatically when passed as 'masks' key
+        # No need for mask_params
+        compose_kwargs = {
+            "bbox_params": A.BboxParams(format='coco', clip=False),
+            "keypoint_params": None,
+        }
+        self._augmentation_transform = A.Compose(transforms_list, **compose_kwargs)
 
-    def _apply_augmentation(self, image_tensor: Tensor) -> Tensor:
-        if self._augmentation_pipeline is None or not self.training:
-            return image_tensor
-        if isinstance(self._augmentation_pipeline, type(None)):
-            return image_tensor
-        if "kornia" in str(type(self._augmentation_pipeline)):
-            import kornia.augmentation as K
-            if isinstance(image_tensor, Tensor):
-                image_tensor = image_tensor.unsqueeze(0)
-                augmented = self._augmentation_pipeline(image_tensor)
-                return augmented.squeeze(0)
+    def _load_and_augment_tensor(
+        self, image_id: int, annotations: list[dict[str, Any]], support: bool = False
+    ) -> tuple[Tensor, torch.Tensor, torch.Tensor | None, int, int]:
+        """Load image and apply augmentation to both image and annotations."""
+        import numpy as np
+        
+        coco = self.support_coco if support else self.coco
+        metadata = coco.loadImgs([image_id])[0]
+        image_root = self.support_image_dir if support else self.image_dir
+        image = Image.open(image_root / metadata["file_name"]).convert("RGB")
+        width, height = image.size
+        
+        if self._augmentation_transform is None or not annotations:
+            tensor = TF.resize(TF.to_tensor(image), [self.resolution, self.resolution])
+            boxes = torch.stack([
+                self._normalize_box(ann["bbox"], width, height) for ann in annotations
+            ]) if annotations else torch.empty((0, 4), dtype=torch.float32)
+            masks = None
+            if self.include_masks and annotations:
+                masks = torch.stack([
+                    TF.resize(
+                        self._ann_to_mask(coco, ann, width, height),
+                        [self.resolution, self.resolution],
+                        interpolation=InterpolationMode.NEAREST,
+                    ).squeeze(0).bool()
+                    for ann in annotations
+                ])
+            return tensor, boxes, masks, width, height
+        
+        image_np = np.array(image)
+        coco_boxes = [ann["bbox"] for ann in annotations]
+        
+        if self.include_masks and annotations:
+            # Pass masks as list of (H, W) numpy arrays
+            coco_masks = [
+                self._ann_to_mask(coco, ann, width, height).squeeze(0).numpy().astype(np.uint8)
+                for ann in annotations
+            ]
         else:
-            import numpy as np
-            image_np = image_tensor.detach().cpu().numpy().transpose(1, 2, 0)
-            augmented = self._augmentation_pipeline(image=image_np)
-            return torch.from_numpy(augmented["image"].transpose(2, 0, 1)).float().to(image_tensor.device)
+            coco_masks = None
+        
+        transformed = self._augmentation_transform(
+            image=image_np,
+            bboxes=coco_boxes,
+            masks=coco_masks
+        )
+        
+        image_aug = transformed["image"]
+        boxes_aug = transformed["bboxes"]
+        masks_aug = transformed.get("masks")
+        
+        image_aug_pil = Image.fromarray(image_aug)
+        tensor = TF.resize(TF.to_tensor(image_aug_pil), [self.resolution, self.resolution])
+        
+        boxes = torch.stack([
+            self._normalize_box(box, width, height) for box in boxes_aug
+        ]) if boxes_aug else torch.empty((0, 4), dtype=torch.float32)
+        
+        masks_tensor = None
+        if masks_aug is not None and self.include_masks:
+            # Handle masks_aug which could be a list or numpy array
+            if isinstance(masks_aug, np.ndarray):
+                # If it's a stacked array (N, H, W), split into list
+                masks_list = [masks_aug[i] for i in range(len(masks_aug))]
+            elif isinstance(masks_aug, list):
+                masks_list = masks_aug
+            else:
+                masks_list = [masks_aug]
+            
+            masks_tensor_list = []
+            for mask in masks_list:
+                if isinstance(mask, np.ndarray):
+                    mask_t = torch.from_numpy(mask).float().unsqueeze(0)
+                else:
+                    mask_t = mask.float().unsqueeze(0) if torch.is_tensor(mask) else torch.from_numpy(np.array(mask)).float().unsqueeze(0)
+                resized = TF.resize(
+                    mask_t,
+                    [self.resolution, self.resolution],
+                    interpolation=InterpolationMode.NEAREST,
+                ).squeeze(0).bool()
+                masks_tensor_list.append(resized)
+            
+            masks_tensor = torch.stack(masks_tensor_list)
+            
+            # Ensure masks and boxes have same count
+            num_boxes = boxes.shape[0]
+            num_masks = masks_tensor.shape[0]
+            if num_boxes != num_masks:
+                import warnings
+                warnings.warn(f"Boxes and masks count mismatch: {num_boxes} vs {num_masks}. Truncating to min.")
+                min_count = min(num_boxes, num_masks)
+                boxes = boxes[:min_count]
+                masks_tensor = masks_tensor[:min_count]
+        
+        return tensor, boxes, masks_tensor, width, height
 
     def _load_tensor(
         self, image_id: int, support: bool = False
@@ -219,9 +287,6 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
         image = Image.open(image_root / metadata["file_name"]).convert("RGB")
         width, height = image.size
         tensor = TF.resize(TF.to_tensor(image), [self.resolution, self.resolution])
-        # if not support and self.training and self.aug_config:
-        # if self.training and self.aug_config:
-        tensor = self._apply_augmentation(tensor)
         return tensor, width, height
 
     @staticmethod
@@ -275,24 +340,26 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                 [] if negative_class_episode
                 else self.category_image_instances[category_id][query_id]
             )
-            query_tensor, query_width, query_height = self._load_tensor(query_id)
-            target_boxes = torch.stack(
-                [self._normalize_box(ann["bbox"], query_width, query_height) for ann in query_annotations]
-            ) if query_annotations else torch.empty((0, 4), dtype=torch.float32)
-            target_masks = None
-            if self.include_masks:
-                target_masks = torch.stack(
-                    [
-                        TF.resize(
-                            self._ann_to_mask(self.coco, ann, query_width, query_height),
-                            [self.resolution, self.resolution],
-                            interpolation=InterpolationMode.NEAREST,
-                        ).squeeze(0).bool()
-                        for ann in query_annotations
-                    ]
-                ) if query_annotations else torch.zeros(
-                    (0, self.resolution, self.resolution), dtype=torch.bool
-                )
+            if query_annotations and self._augmentation_transform is not None and self.training:
+                query_tensor, target_boxes, target_masks, query_width, query_height = \
+                    self._load_and_augment_tensor(query_id, query_annotations, support=False)
+            else:
+                query_tensor, query_width, query_height = self._load_tensor(query_id)
+                target_boxes = torch.stack(
+                    [self._normalize_box(ann["bbox"], query_width, query_height) for ann in query_annotations]
+                ) if query_annotations else torch.empty((0, 4), dtype=torch.float32)
+                target_masks = None
+                if self.include_masks and query_annotations:
+                    target_masks = torch.stack(
+                        [
+                            TF.resize(
+                                self._ann_to_mask(self.coco, ann, query_width, query_height),
+                                [self.resolution, self.resolution],
+                                interpolation=InterpolationMode.NEAREST,
+                            ).squeeze(0).bool()
+                            for ann in query_annotations
+                        ]
+                    )
 
             support_ids = sorted(self.support_category_images[category_id])
             if self.training:
@@ -330,40 +397,71 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
                 negative_annotations = rng.sample(negative_candidates, negative_count)
                 shot_prompts = [prompt_annotation, *negative_annotations]
                 support_prompt_annotation_ids.append([ann["id"] for ann in shot_prompts])
-                support_tensor, support_width, support_height = self._load_tensor(support_id, support=True)
-                support_images.append(support_tensor)
-                support_boxes.append(torch.stack([
-                    self._normalize_box(ann["bbox"], support_width, support_height)
-                    for ann in shot_prompts
-                ]))
-                support_labels.append(torch.tensor(
-                    [1, *([0] * negative_count)], dtype=torch.long
-                ))
-                support_prompt_valid.append(torch.ones(len(shot_prompts), dtype=torch.bool))
-                support_target_boxes.append(torch.stack([
-                    self._normalize_box(ann["bbox"], support_width, support_height)
-                    for ann in support_annotations
-                ]))
-                support_target_prompt_masks.append(torch.tensor(
-                    [ann["id"] == prompt_annotation["id"] for ann in support_annotations],
-                    dtype=torch.bool,
-                ))
-                if self.include_masks:
-                    support_prompt_masks.append(
-                        TF.resize(
-                            self._ann_to_mask(self.support_coco, prompt_annotation, support_width, support_height),
-                            [self.resolution, self.resolution],
-                            interpolation=InterpolationMode.NEAREST,
-                        ).squeeze(0).bool()
-                    )
-                    support_target_masks.append(torch.stack([
-                        TF.resize(
-                            self._ann_to_mask(self.support_coco, ann, support_width, support_height),
-                            [self.resolution, self.resolution],
-                            interpolation=InterpolationMode.NEAREST,
-                        ).squeeze(0).bool()
+                
+                if self._augmentation_transform is not None and self.training:
+                    # Combine all annotations and augment once to ensure consistent transforms
+                    all_support_anns = shot_prompts + support_annotations
+                    support_tensor, all_boxes_aug, all_masks_raw, support_width, support_height = \
+                        self._load_and_augment_tensor(support_id, all_support_anns, support=True)
+                    
+                    num_prompts = len(shot_prompts)
+                    # Split by original index - boxes are in same order as input
+                    support_prompt_boxes = all_boxes_aug[:num_prompts]
+                    support_target_boxes_aug = all_boxes_aug[num_prompts:]
+                    
+                    support_images.append(support_tensor)
+                    support_boxes.append(support_prompt_boxes)
+                    support_target_boxes.append(support_target_boxes_aug)
+                    
+                    if self.include_masks and all_masks_raw is not None:
+                        support_prompt_masks_raw = all_masks_raw[:num_prompts]
+                        support_target_masks_raw = all_masks_raw[num_prompts:]
+                        support_prompt_masks.append(support_prompt_masks_raw)
+                        support_target_masks.append(support_target_masks_raw)
+                    else:
+                        support_prompt_masks.append(None)
+                        support_target_masks.append(None)
+                    
+                    support_labels.append(torch.tensor(
+                        [1, *([0] * negative_count)], dtype=torch.long
+                    ))
+                    support_prompt_valid.append(torch.ones(support_prompt_boxes.shape[0], dtype=torch.bool))
+                    support_target_prompt_masks.append(torch.zeros(support_target_boxes_aug.shape[0], dtype=torch.bool))
+                else:
+                    support_tensor, support_width, support_height = self._load_tensor(support_id, support=True)
+                    support_images.append(support_tensor)
+                    support_boxes.append(torch.stack([
+                        self._normalize_box(ann["bbox"], support_width, support_height)
+                        for ann in shot_prompts
+                    ]))
+                    support_target_boxes.append(torch.stack([
+                        self._normalize_box(ann["bbox"], support_width, support_height)
                         for ann in support_annotations
                     ]))
+                    support_labels.append(torch.tensor(
+                        [1, *([0] * negative_count)], dtype=torch.long
+                    ))
+                    support_prompt_valid.append(torch.ones(len(shot_prompts), dtype=torch.bool))
+                    support_target_prompt_masks.append(torch.tensor(
+                        [ann["id"] == prompt_annotation["id"] for ann in support_annotations],
+                        dtype=torch.bool,
+                    ))
+                    if self.include_masks:
+                        support_prompt_masks.append(
+                            TF.resize(
+                                self._ann_to_mask(self.support_coco, prompt_annotation, support_width, support_height),
+                                [self.resolution, self.resolution],
+                                interpolation=InterpolationMode.NEAREST,
+                            ).squeeze(0).bool()
+                        )
+                        support_target_masks.append(torch.stack([
+                            TF.resize(
+                                self._ann_to_mask(self.support_coco, ann, support_width, support_height),
+                                [self.resolution, self.resolution],
+                                interpolation=InterpolationMode.NEAREST,
+                            ).squeeze(0).bool()
+                            for ann in support_annotations
+                        ]))
             max_prompts = max(boxes.shape[0] for boxes in support_boxes)
             padded_support_boxes = torch.zeros((len(support_boxes), max_prompts, 4), dtype=torch.float32)
             padded_support_labels = torch.zeros((len(support_boxes), max_prompts), dtype=torch.long)
@@ -644,20 +742,60 @@ def collate_support_query(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "support_image_ids": [item["support_image_ids"] for item in batch],
         "prompt_annotation_ids": [item["prompt_annotation_ids"] for item in batch],
     }
-    if batch[0].get("target_masks") is not None:
-        resolution = batch[0]["target_masks"].shape[-1]
-        target_masks = torch.zeros((len(batch), max_targets, resolution, resolution), dtype=torch.bool)
-        for index, item in enumerate(batch):
-            masks = item["target_masks"]
-            target_masks[index, :masks.shape[0]] = masks
-        result["query_masks"] = target_masks
+    # Check if any item has target_masks or support_target_masks
+    has_query_masks = any(item.get("target_masks") is not None for item in batch)
+    has_support_masks = any(
+        item.get("support_target_masks") is not None and 
+        any(m is not None for m in item["support_target_masks"])
+        for item in batch
+    )
+    has_masks = has_query_masks or has_support_masks
+    
+    if has_masks:
+        # Determine resolution from first available mask
+        resolution = 560  # default
+        if has_query_masks:
+            for item in batch:
+                if item.get("target_masks") is not None:
+                    resolution = item["target_masks"].shape[-1]
+                    break
+        elif has_support_masks:
+            for item in batch:
+                if item.get("support_target_masks") is not None:
+                    for shot_masks in item["support_target_masks"]:
+                        if shot_masks is not None:
+                            resolution = shot_masks.shape[-1]
+                            break
+                    if resolution != 560:
+                        break
+        
+        # Create query_masks
+        if has_query_masks:
+            target_masks = torch.zeros((len(batch), max_targets, resolution, resolution), dtype=torch.bool)
+            for index, item in enumerate(batch):
+                masks = item.get("target_masks")
+                if masks is not None:
+                    target_masks[index, :masks.shape[0]] = masks
+            result["query_masks"] = target_masks
+        
+        # Create support_target_masks
         support_masks = torch.zeros(
             (len(batch), support_count, max_support_targets, resolution, resolution), dtype=torch.bool
         )
         for batch_index, item in enumerate(batch):
             for shot_index, boxes in enumerate(item["support_target_boxes"]):
                 count = boxes.shape[0]
-                support_masks[batch_index, shot_index, :count] = item["support_target_masks"][shot_index]
+                if item.get("support_target_masks") is not None and shot_index < len(item["support_target_masks"]):
+                    shot_masks = item["support_target_masks"][shot_index]
+                    if shot_masks is not None and count > 0 and shot_masks.shape[0] == count:
+                        support_masks[batch_index, shot_index, :count] = shot_masks
+                    elif shot_masks is not None and count > 0:
+                        # Dimension mismatch - truncate
+                        actual_count = min(count, shot_masks.shape[0])
+                        support_masks[batch_index, shot_index, :actual_count] = shot_masks[:actual_count]
         result["support_target_masks"] = support_masks
-        result["support_prompt_masks"] = torch.stack([item["support_prompt_masks"] for item in batch])
+        result["support_prompt_masks"] = torch.stack([
+            item["support_prompt_masks"] for item in batch if item["support_prompt_masks"] is not None
+        ]) if any(item["support_prompt_masks"] is not None for item in batch) else None
+    
     return result
