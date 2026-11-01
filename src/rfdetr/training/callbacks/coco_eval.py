@@ -805,9 +805,15 @@ class COCOEvalCallback(Callback):
                 should_compute_ema, ema_metrics = self._compute_and_log_ema_metrics(
                     trainer, pl_module, split, pfx, mar_key
                 )
+                keypoint_overall: dict[str, float] = {}
                 if should_compute_ema:
-                    self._compute_and_log_keypoint_map(
-                        "val_ema", pl_module, trainer, log_split="val", metric_prefix="ema_"
+                    keypoint_overall = self._compute_and_log_keypoint_map(
+                        "val_ema",
+                        pl_module,
+                        trainer,
+                        log_split="val",
+                        metric_prefix="ema_",
+                        display_prefix="",
                     )
                     self._mirror_ema_metrics_to_primary_keys(trainer, pl_module, split)
                 else:
@@ -824,7 +830,15 @@ class COCOEvalCallback(Callback):
                 # for the whole run even though ema_metrics has real per-class data (#1285).
                 if should_compute_ema and ema_metrics is not None:
                     self._print_ema_only_summary(
-                        trainer, pl_module, split, pfx, mar_key, ema_metrics, f1_overall, f1_by_cid
+                        trainer,
+                        pl_module,
+                        split,
+                        pfx,
+                        mar_key,
+                        ema_metrics,
+                        f1_overall,
+                        f1_by_cid,
+                        keypoint_overall,
                     )
             self._reset_f1_local(split)
             logger.debug("Skipping %s COCO metric compute because no predictions were accumulated.", split)
@@ -912,12 +926,16 @@ class COCOEvalCallback(Callback):
             metrics=metrics, pfx=pfx, split=split, pl_module=pl_module, ar_by_cid=ar_by_cid, f1_by_cid=f1_by_cid
         )
 
-        self._print_metrics_tables(trainer, split, overall, per_class)
-        self._compute_and_log_keypoint_map(split, pl_module, trainer)
+        overall.update(self._compute_and_log_keypoint_map(split, pl_module, trainer))
         if split == "val" and should_compute_ema:
-            self._compute_and_log_keypoint_map("val_ema", pl_module, trainer, log_split="val", metric_prefix="ema_")
+            overall.update(
+                self._compute_and_log_keypoint_map(
+                    "val_ema", pl_module, trainer, log_split="val", metric_prefix="ema_"
+                )
+            )
         elif split == "val":
             self._reset_keypoint_split("val_ema")
+        self._print_metrics_tables(trainer, split, overall, per_class)
         metric.reset()
         self._reset_f1_local(split)
 
@@ -1104,8 +1122,9 @@ class COCOEvalCallback(Callback):
         *,
         log_split: str | None = None,
         metric_prefix: str = "",
-    ) -> None:
-        """Compute and log OKS keypoint AP/AR metrics when keypoint mode is active.
+        display_prefix: str | None = None,
+    ) -> dict[str, float]:
+        """Compute/log keypoint OKS metrics and return their console-table labels.
 
         Args:
             split: Internal metric split (``"val"``, ``"val_ema"``, ``"train"``, ``"test"``).
@@ -1113,10 +1132,14 @@ class COCOEvalCallback(Callback):
             trainer: The PTL Trainer (provides ``callback_metrics``).
             log_split: Namespace prefix for logged keys. Defaults to *split*.
             metric_prefix: Optional string prepended to each metric name (e.g. ``"ema_"``).
+
+        Returns:
+            Display-name to scalar mapping for the overall metrics table. Metrics unavailable
+            from COCOeval (negative sentinel values) are omitted.
         """
         metric = self._keypoint_oks_metrics.get(split)
         if not self._keypoint_mode or metric is None:
-            return
+            return {}
         # Cross-rank vote before entering compute(): metric.compute() calls
         # synchronize_between_processes() which issues an all_gather collective. If any
         # rank short-circuits here without joining that collective the process group
@@ -1127,9 +1150,17 @@ class COCOEvalCallback(Callback):
             dist.all_reduce(flag, op=dist.ReduceOp.MIN)
             has_updates_vote = int(flag.item())
         if not has_updates_vote:
-            return
+            return {}
 
         log_split = split if log_split is None else log_split
+        display_prefix = metric_prefix if display_prefix is None else display_prefix
+        display_metric_names = {
+            "keypoint_map_50_95": "KP mAP 50:95",
+            "keypoint_map_50": "KP mAP 50",
+            "keypoint_map_75": "KP mAP 75",
+            "keypoint_mAR": "KP mAR",
+        }
+        display_metrics: dict[str, float] = {}
         try:
             stats = metric.compute()
             keypoint_metrics = {
@@ -1145,8 +1176,13 @@ class COCOEvalCallback(Callback):
                 log_key = f"{log_split}/{metric_prefix}{metric_name}"
                 pl_module.log(log_key, value, prog_bar=prog_bar, logger=True, on_step=False, on_epoch=True)
                 trainer.callback_metrics[log_key] = torch.tensor(value)
+                display_name = display_metric_names[metric_name]
+                if display_prefix:
+                    display_name = f"EMA {display_name}"
+                display_metrics[display_name] = float(value)
         finally:
             metric.reset()
+        return display_metrics
 
     def _print_ema_only_summary(
         self,
@@ -1158,6 +1194,7 @@ class COCOEvalCallback(Callback):
         ema_metrics: dict[str, Any],
         f1_overall: dict[str, float],
         f1_by_cid: dict[int, dict[str, float]],
+        keypoint_overall: dict[str, float] | None = None,
     ) -> None:
         """Print the Rich summary table from ``ema_metrics`` when it is the epoch's only track with data.
 
@@ -1181,6 +1218,7 @@ class COCOEvalCallback(Callback):
                 EMA-prefixed by existing design (see ``TrainConfig.eval_base_model`` docstring) since
                 ``f1_local`` has no parallel EMA-tracked accumulator.
             f1_by_cid: Per-class F1/precision/recall keyed by ``category_id``, from the same call.
+            keypoint_overall: Keypoint AP/AR values from this epoch's EMA predictions.
         """
         if "classes" in ema_metrics and ema_metrics["classes"].ndim == 0:
             ema_metrics = dict(ema_metrics)
@@ -1200,6 +1238,7 @@ class COCOEvalCallback(Callback):
             overall_ema["segm mAP 50:95"] = float(ema_metrics["segm_map"])
             overall_ema["segm mAP 50"] = float(ema_metrics["segm_map_50"])
         overall_ema.update(f1_overall)
+        overall_ema.update(keypoint_overall or {})
 
         ar_pc_key = f"{pfx}mar_{self._max_dets}_per_class"
         ar_by_cid: dict[int, float] = {}

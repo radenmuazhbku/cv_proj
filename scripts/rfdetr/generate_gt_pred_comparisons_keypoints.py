@@ -10,9 +10,6 @@ Example:
 --annotations datasets/scalebar_H1H2/test/_annotations.coco.json \
 --output-dir logs/comparisons/test --count 10
 """
-
-from __future__ import annotations
-
 import argparse
 import json
 from collections import defaultdict
@@ -38,6 +35,7 @@ _PRED_SV_COLOR = None  # resolved lazily
 def _sv_color(rgb: tuple[int, int, int]) -> Any:
     """Return an ``sv.Color`` from an RGB tuple."""
     import supervision as sv
+
     # Supervision's OpenCV annotators write BGR pixels; the source canvases here
     # are RGB arrays, so reverse channels to preserve the requested display color.
     return sv.Color(r=rgb[2], g=rgb[1], b=rgb[0])
@@ -55,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--count", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--threshold", type=float, default=0.35)
+    parser.add_argument("--threshold", type=float, default=0.05)
     parser.add_argument("--device", default=None, help="Override checkpoint device, e.g. cuda or cpu.")
     return parser.parse_args()
 
@@ -212,14 +210,18 @@ def _annotate(
         # the dedicated palette separates keypoints from the box/mask colors.
         point_color = keypoint_color or box_color
         halo_color = _sv_color(KEYPOINT_HALO_COLOR)
-        try:
-            scene = sv.EdgeAnnotator(color=halo_color, thickness=6).annotate(scene, keypoints)
-        except Exception:
-            pass
-        try:
-            scene = sv.EdgeAnnotator(color=point_color, thickness=3).annotate(scene, keypoints)
-        except Exception:
-            pass
+        # Two-point annotations in this dataset have landmarks but no skeleton
+        # topology. Skip edges to avoid Supervision's "No skeleton found with 2
+        # vertices" warning; keep the outlined landmarks visible.
+        if keypoints.xy.shape[1] > 2:
+            try:
+                scene = sv.EdgeAnnotator(color=halo_color, thickness=6).annotate(scene, keypoints)
+            except Exception:
+                pass
+            try:
+                scene = sv.EdgeAnnotator(color=point_color, thickness=3).annotate(scene, keypoints)
+            except Exception:
+                pass
         try:
             scene = sv.VertexAnnotator(color=halo_color, radius=8).annotate(scene, keypoints)
         except Exception:

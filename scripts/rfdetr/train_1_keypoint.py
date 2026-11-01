@@ -14,9 +14,6 @@ from typing import Any
 from rfdetr import RFDETRKeypointPreview
 from rfdetr.datasets._keypoint_schema import infer_coco_keypoint_schema
 from rfdetr.training.callbacks.qual_visualizer import QualitativeVisualizerCallback
-import logging
-logging.getLogger("supervision").setLevel(logging.ERROR)
-
 # Mapping of checkpoint families to architectural defaults so backbones load seamlessly
 CHECKPOINT_ARCH_DEFAULTS = {
     "keypoint": {
@@ -211,7 +208,7 @@ def main() -> None:
     qual_cb = QualitativeVisualizerCallback(
         output_dir=args.output_dir / "visualizations",
         num_images=8,
-        threshold=0.3,
+        threshold=0.1,
         class_names=class_names,
     )
 

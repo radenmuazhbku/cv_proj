@@ -21,9 +21,7 @@ import numpy as np
 import torch
 from pytorch_lightning import Callback
 from torchvision import transforms as T  # type: ignore[import-untyped]
-
 logger = logging.getLogger(__name__)
-
 # ------------------------------------------------------------------
 # ImageNet inverse normalisation (applied to [C, H, W] tensors that
 # were normalised by mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
@@ -146,12 +144,25 @@ def _annotate_scene(
     if keypoints is not None and len(keypoints) > 0:
         halo_color = _sv_color(_KEYPOINT_HALO_COLOR)
         # Dark underlay plus saturated edges and vertices mirrors the comparison script.
-        for annotator in (
-            sv.EdgeAnnotator(color=halo_color, thickness=6),
-            sv.EdgeAnnotator(color=keypoint_color, thickness=3),
-            sv.VertexAnnotator(color=halo_color, radius=8),
-            sv.VertexAnnotator(color=keypoint_color, radius=5),
-        ):
+        # Supervision has no built-in skeleton for this project's two-point schema;
+        # invoking EdgeAnnotator for it only emits "No skeleton found with 2 vertices".
+        # Keep the landmarks visible as outlined vertices and draw limbs only when a
+        # multi-point skeleton may be defined by Supervision.
+        annotators = []
+        if keypoints.xy.shape[1] > 2:
+            annotators.extend(
+                (
+                    sv.EdgeAnnotator(color=halo_color, thickness=6),
+                    sv.EdgeAnnotator(color=keypoint_color, thickness=3),
+                )
+            )
+        annotators.extend(
+            (
+                sv.VertexAnnotator(color=halo_color, radius=8),
+                sv.VertexAnnotator(color=keypoint_color, radius=5),
+            )
+        )
+        for annotator in annotators:
             try:
                 scene = annotator.annotate(scene, keypoints)
             except Exception:

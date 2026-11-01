@@ -105,6 +105,28 @@ def _render_overall_merged(title_pfx: str, overall: dict[str, float], max_dets: 
             ],
         ),
         ("mAR", [(mar_lbl, _fmt(overall[mar_key]))]),
+    ]
+    for metric_prefix, group_label in (("KP", "Keypoint mAP"), ("EMA KP", "EMA Keypoint mAP")):
+        map_keys = [
+            f"{metric_prefix} mAP 50:95",
+            f"{metric_prefix} mAP 50",
+            f"{metric_prefix} mAP 75",
+        ]
+        present = [key in overall for key in map_keys]
+        if any(present):
+            groups.append(
+                (
+                    group_label,
+                    [
+                        (label, _fmt(overall[key]) if key in overall else "—")
+                        for label, key in zip(("50:95", "50", "75"), map_keys, strict=True)
+                    ],
+                )
+            )
+        mar_name = f"{metric_prefix} mAR"
+        if mar_name in overall:
+            groups.append((f"{metric_prefix} mAR", [("OKS", _fmt(overall[mar_name]))]))
+    groups.append(
         (
             "F1 sweep",
             [
@@ -112,8 +134,8 @@ def _render_overall_merged(title_pfx: str, overall: dict[str, float], max_dets: 
                 ("Prec", _fmt(overall["Precision"])),
                 ("Recall", _fmt(overall["Recall"])),
             ],
-        ),
-    ]
+        )
+    )
     if "segm mAP 50:95" in overall:
         groups.append(
             (
