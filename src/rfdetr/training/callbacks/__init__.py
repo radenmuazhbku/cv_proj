@@ -13,6 +13,7 @@ from rfdetr.training.callbacks.gpu_memory_progress_bar import (
     GPUMemoryRichProgressBar,
     GPUMemoryTQDMProgressBar,
 )
+from rfdetr.training.callbacks.qual_visualizer import QualitativeVisualizerCallback
 
 __all__ = [
     "BestModelCallback",
@@ -20,6 +21,7 @@ __all__ = [
     "DropPathCallback",
     "GPUMemoryRichProgressBar",
     "GPUMemoryTQDMProgressBar",
+    "QualitativeVisualizerCallback",
     "RFDETREMACallback",
     "RFDETREarlyStopping",
 ]

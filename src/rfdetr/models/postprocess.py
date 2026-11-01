@@ -76,6 +76,26 @@ class PostProcess(nn.Module):
         scores, labels, topk_boxes = self._select_topk(out_logits)
         boxes = self._gather_and_scale_boxes(out_bbox, topk_boxes, target_sizes)
 
+        if out_masks is not None and out_keypoints is not None:
+            kp_results = self._postprocess_keypoints(out_keypoints, scores, labels, boxes, topk_boxes, target_sizes)
+            mask_results = self._postprocess_masks(
+                out_masks,
+                scores,
+                labels,
+                boxes,
+                topk_boxes,
+                target_sizes,
+                self.upsample_masks_to_image_size,
+                score_threshold=None,
+            )
+            combined = []
+            for kp_res, mask_res in zip(kp_results, mask_results):
+                res = dict(kp_res)
+                if "masks" in mask_res:
+                    res["masks"] = mask_res["masks"]
+                combined.append(res)
+            return combined
+
         if out_masks is not None:
             return self._postprocess_masks(
                 out_masks,
@@ -98,23 +118,7 @@ class PostProcess(nn.Module):
         out_keypoints: torch.Tensor | None,
         target_sizes: torch.Tensor,
     ) -> None:
-        """Validate mutually exclusive output heads and per-image target sizes.
-
-        Args:
-            out_logits: Classification logits with shape ``(B, Q, C)``.
-            out_masks: Optional mask logits from segmentation models.
-            out_keypoints: Optional keypoint predictions from keypoint models.
-            target_sizes: Per-image ``(height, width)`` tensor with shape
-                ``(B, 2)``.
-
-        Raises:
-            ValueError: If both masks and keypoints are present in the model
-                outputs at the same time. Mask and keypoint heads are mutually
-                exclusive at inference.
-            AssertionError: If batch dimensions do not match ``target_sizes``.
-        """
-        if out_masks is not None and out_keypoints is not None:
-            raise ValueError("masks and keypoints cannot be used together in postprocessing.")
+        """Validate per-image target sizes and outputs."""
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 

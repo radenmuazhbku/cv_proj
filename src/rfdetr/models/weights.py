@@ -620,6 +620,25 @@ def load_pretrain_weights(
         )
         checkpoint["model"].pop("_kp_active_mask", None)
     interpolate_position_embeddings(checkpoint["model"], mc.positional_encoding_size)
+
+    # Drop any parameters with shape mismatches so all compatible parts can load
+    model_state = nn_model.state_dict()
+    shape_mismatches = []
+    for k, v in list(checkpoint["model"].items()):
+        if k in model_state and hasattr(v, "shape") and v.shape != model_state[k].shape:
+            shape_mismatches.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            checkpoint["model"].pop(k)
+
+    if shape_mismatches:
+        for k, ckpt_shape, model_shape in shape_mismatches:
+            logger.warning(
+                "load_pretrain_weights: dropping parameter '%s' due to shape mismatch: "
+                "checkpoint has %s, model expects %s. This layer will remain randomly initialized.",
+                k,
+                ckpt_shape,
+                model_shape,
+            )
+
     incompatible = nn_model.load_state_dict(checkpoint["model"], strict=False)
     _warn_on_partial_load(incompatible, pretrain_weights)
 

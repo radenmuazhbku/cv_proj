@@ -948,6 +948,7 @@ class RFDETR:
         # Absorb the special train/evaluate kwargs (device, resolution, deprecated knobs),
         # build the TrainConfig, and resolve any auto batch size.  Shared with evaluate()
         # so both accept exactly the same keyword arguments.
+        _custom_callbacks = kwargs.pop("callbacks", None)
         config, _accelerator, _devices = _prepare_run_config(self, **kwargs)
 
         # Auto-detect num_classes from the training dataset and align model_config.
@@ -1062,6 +1063,8 @@ class RFDETR:
         trainer_kwargs: dict[str, Any] = {"accelerator": _accelerator}
         if _devices is not None:
             trainer_kwargs["devices"] = _devices
+        if _custom_callbacks is not None:
+            trainer_kwargs["callbacks"] = _custom_callbacks
         trainer = build_trainer(config, self.model_config, **trainer_kwargs)
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
@@ -2727,6 +2730,8 @@ class RFDETR:
             if has_keypoints and keypoints_array is not None:
                 keypoint_data = dict(detections.data)
                 keypoint_data["xyxy"] = detections.xyxy.astype(np.float32)
+                if detections.mask is not None:
+                    keypoint_data["mask"] = detections.mask
                 if include_source_image:
                     keypoint_data["source_image"] = [
                         source_images[i]  # type: ignore[index]

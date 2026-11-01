@@ -1668,5 +1668,8 @@ class KeypointTrainConfig(TrainConfig):
     keypoint_findable_loss_coef: float = 1
     keypoint_visible_loss_coef: float = 1
     keypoint_nll_loss_coef: float = 1.0
+    mask_point_sample_ratio: int = 16
+    mask_ce_loss_coef: float = 5.0
+    mask_dice_loss_coef: float = 5.0
     smooth_alpha: float = 0.5
     skip_best_epochs: int = Field(default=10, ge=0)

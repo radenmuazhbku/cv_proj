@@ -4,39 +4,43 @@ python3 filter_split.py \
         nt_dataset.json \
         crl_dataset.json \
         nasal_dataset.json \
+        scalebar_dataset.json\
     --lists \
         list_Hospital-1.txt \
         list_Hospital-2.txt \
-    --output nt_crl_nb_splitH1H2.json
+    --output split_H1H2.json
 
 python3 filter_split.py \
     --annotations \
         nt_dataset.json \
         crl_dataset.json \
         nasal_dataset.json \
+        scalebar_dataset.json \
     --lists \
         list_Hospital-1.txt \
         list_Hospital-2.txt \
         list_Hospital-3.txt \
-    --output nt_crl_nb_splitH1H2H3.json
+    --output split_H1H2H3.json
 
 python3 filter_split.py \
     --annotations \
         nt_dataset.json \
         crl_dataset.json \
         nasal_dataset.json \
+        scalebar_dataset.json \
     --lists \
         list_Standard.txt \
-    --output nt_crl_nb_Standard.json
+    --output split_Standard.json
 
 python3 filter_split.py \
     --annotations \
         nt_dataset.json \
         crl_dataset.json \
         nasal_dataset.json \
+        scalebar_dataset.json \
     --lists \
         list_Non-standard.txt \
-    --output nt_crl_nb_Non-standard.json
+    --output split_Non-standard.json
 """
 import argparse
 import json

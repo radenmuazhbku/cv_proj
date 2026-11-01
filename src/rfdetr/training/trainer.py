@@ -728,6 +728,13 @@ def build_trainer(
         )
     )
 
+    extra_callbacks = trainer_kwargs.pop("callbacks", None)
+    if extra_callbacks:
+        if isinstance(extra_callbacks, (list, tuple)):
+            callbacks.extend(extra_callbacks)
+        else:
+            callbacks.append(extra_callbacks)
+
     # eval_interval must skip the whole validation loop, not just metric logging: without
     # check_val_every_n_epoch Lightning runs (and COCOEvalCallback discards) a full validation
     # pass — including the EMA forward — on every non-eval epoch.  The final epoch is always

@@ -177,7 +177,7 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
         # In Albumentations 2.x, masks are handled automatically when passed as 'masks' key
         # No need for mask_params
         compose_kwargs = {
-            "bbox_params": A.BboxParams(format='coco', clip=False),
+            "bbox_params": A.BboxParams(format='coco', clip=True),
             "keypoint_params": None,
         }
         self._augmentation_transform = A.Compose(transforms_list, **compose_kwargs)
@@ -212,7 +212,11 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
             return tensor, boxes, masks, width, height
         
         image_np = np.array(image)
-        coco_boxes = [ann["bbox"] for ann in annotations]
+        # Convert COCO JSON format [x, y, w, h] to Albumentations COCO format [x_min, y_min, x_max, y_max]
+        coco_boxes = [
+            [ann["bbox"][0], ann["bbox"][1], ann["bbox"][0] + ann["bbox"][2], ann["bbox"][1] + ann["bbox"][3]]
+            for ann in annotations
+        ]
         
         if self.include_masks and annotations:
             # Pass masks as list of (H, W) numpy arrays
@@ -236,8 +240,10 @@ class CocoFewShotEpisodeDataset(Dataset[dict[str, Any]]):
         image_aug_pil = Image.fromarray(image_aug)
         tensor = TF.resize(TF.to_tensor(image_aug_pil), [self.resolution, self.resolution])
         
+        # Convert back from Albumentations COCO format [x_min, y_min, x_max, y_max] to COCO JSON [x, y, w, h]
         boxes = torch.stack([
-            self._normalize_box(box, width, height) for box in boxes_aug
+            self._normalize_box([box[0], box[1], box[2] - box[0], box[3] - box[1]], width, height)
+            for box in boxes_aug
         ]) if boxes_aug else torch.empty((0, 4), dtype=torch.float32)
         
         masks_tensor = None

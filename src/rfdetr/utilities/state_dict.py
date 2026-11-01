@@ -369,7 +369,12 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
             _inferred_ps = int(_ckpt_proj_shape[-1])
             _model_ps: int | None = getattr(model_args, "patch_size", None)
             if _model_ps is not None and _inferred_ps != _model_ps:
-                _raise_patch_size_mismatch(_inferred_ps, _model_ps)
+                logger.warning(
+                    "Checkpoint inferred patch_size=%s differs from model patch_size=%s. "
+                    "Patch projection weights will be skipped and reinitialized.",
+                    _inferred_ps,
+                    _model_ps,
+                )
     if "args" not in checkpoint:
         return
 
@@ -382,33 +387,30 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
         and model_segmentation_head is not None
         and ckpt_segmentation_head != model_segmentation_head
     ):
-        if ckpt_segmentation_head:
-            raise ValueError(
-                "The checkpoint was trained with a segmentation head, but the current model does not have one. "
-                "Load the weights into a segmentation model (e.g. RFDETRSegNano) instead of a detection model."
-            )
-        else:
-            raise ValueError(
-                "The current model has a segmentation head, but the checkpoint was trained without one. "
-                "Load the weights into a detection model (e.g. RFDETRNano) instead of a segmentation model."
-            )
+        logger.warning(
+            "Checkpoint segmentation_head=%s differs from model segmentation_head=%s. "
+            "Loading available matching weights and initializing missing heads from scratch.",
+            ckpt_segmentation_head,
+            model_segmentation_head,
+        )
 
     ckpt_patch_size: int | None = _ckpt_args_get(ckpt_args, "patch_size")
     model_patch_size: int | None = getattr(model_args, "patch_size", None)
     if ckpt_patch_size is not None and model_patch_size is not None and ckpt_patch_size != model_patch_size:
-        _raise_patch_size_mismatch(ckpt_patch_size, model_patch_size)
+        logger.warning(
+            "Checkpoint was trained with patch_size=%s, but model uses patch_size=%s. "
+            "Loading available compatible weights; patch embeddings and position encodings will adapt.",
+            ckpt_patch_size,
+            model_patch_size,
+        )
 
     ckpt_keypoint_head: bool | None = _ckpt_args_get(ckpt_args, "use_grouppose_keypoints")
     model_keypoint_head: bool | None = getattr(model_args, "use_grouppose_keypoints", None)
 
     if ckpt_keypoint_head is not None and model_keypoint_head is not None and ckpt_keypoint_head != model_keypoint_head:
-        if ckpt_keypoint_head:
-            raise ValueError(
-                "The checkpoint was trained with a keypoint head, but the current model does not have one. "
-                "Load the weights into a keypoint model (e.g. RFDETRKeypointPreview) instead of a detection model."
-            )
-        else:
-            raise ValueError(
-                "The current model has a keypoint head, but the checkpoint was trained without one. "
-                "Load the weights into a detection model (e.g. RFDETRNano) instead of a keypoint model."
-            )
+        logger.warning(
+            "Checkpoint use_grouppose_keypoints=%s differs from model use_grouppose_keypoints=%s. "
+            "Loading available matching weights and initializing keypoint head from scratch.",
+            ckpt_keypoint_head,
+            model_keypoint_head,
+        )

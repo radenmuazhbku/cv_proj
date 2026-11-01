@@ -31,7 +31,7 @@ AUG_CONSERVATIVE = {
 }
 
 cfg = {
-    "aug_config": AUG_CONSERVATIVE,
+    "aug_config": None,
     "mode": "support_query",
         # "conditioning_schedule": [
     #     {"mode": "class_embedding", "steps": 100_000},
@@ -40,11 +40,12 @@ cfg = {
     "conditioning_mode": "visual_prompt",
 
         "conditioning_sampling_schedule": [
-        {"class_embedding": 0.5, "visual_prompt": 0.5, "steps": 250_000},
-        {"class_embedding": 0.2, "visual_prompt": 0.8, "steps": 250_000}
+        {"class_embedding": 0.5, "visual_prompt": 0.5, "steps": 500_000},
+        {"class_embedding": 0.3, "visual_prompt": 0.7, "steps": 500_000}
     ],
-    "steps": 500_000,
-    "eval_every": 50_000,
+    "steps": 1_000_000,
+    # "eval_every": 500,
+    "eval_every": 100_000,
     "log_every": 10_000,
     "seed": 7,
     "use_pretrained_model": False,
@@ -63,7 +64,7 @@ cfg = {
     "test_annotation_file": Path("datasets/mscoco_fsod_splits/coco_val_full.json"),
     "test_support_image_dir": Path("datasets/mscoco/train2017"),
     "test_support_annotation_file": Path("datasets/mscoco_fsod_splits/coco_fsod_novel_5shot_seed0.json"),
-    "episodes": 200_000,
+    "episodes": 500_000,
     "shots": 5,
     "negative_prompt_ratio": 0.0,
     "negative_class_ratio": 0.1,
@@ -71,7 +72,7 @@ cfg = {
     "test_negative_class_ratio": 0.0,
     "support_loss_weight": 0.5,
     "include_prompt_box_in_loss": False,
-    "batch_repeat": 1,
+    "batch_repeat": 4,
     "batch_size": 2,
     "eval_batch_size": 2,
     "num_workers": 4,

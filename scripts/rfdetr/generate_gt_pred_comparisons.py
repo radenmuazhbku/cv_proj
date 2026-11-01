@@ -13,7 +13,7 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-
+import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from rfdetr import from_checkpoint
@@ -81,6 +81,7 @@ def main() -> None:
         raise ValueError("--count and --batch-size must be at least 1")
     if not 0 <= args.threshold <= 1:
         raise ValueError("--threshold must be between 0 and 1")
+    os.makedirs(args.output_dir, exist_ok=True)
 
     image_paths = sorted(path for path in args.images_dir.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"})
     image_paths = image_paths[: args.count]

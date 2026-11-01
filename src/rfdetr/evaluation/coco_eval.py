@@ -119,6 +119,39 @@ def _backfill_num_keypoints(coco_gt: COCO) -> None:
             dataset_annotation["num_keypoints"] = annotation["num_keypoints"]
 
 
+def _filter_invalid_keypoint_annotations(coco_gt: COCO) -> None:
+    """Remove annotations without a usable, category-sized keypoint vector.
+
+    Keypoint evaluation backends assume every ground-truth annotation has a
+    ``keypoints`` vector. Detection datasets can legitimately mix keypoint
+    annotations with box-only annotations, represented by an empty list; those
+    records must not be passed to ``computeOks``.
+    """
+    expected_counts = _infer_keypoint_counts_by_category(coco_gt)
+    annotations = getattr(coco_gt, "dataset", {}).get("annotations", [])
+    valid_annotations: list[dict[str, Any]] = []
+    dropped_count = 0
+    for annotation in annotations:
+        keypoints = annotation.get("keypoints")
+        category_id = int(annotation.get("category_id", -1))
+        expected_count = expected_counts.get(category_id)
+        valid = isinstance(keypoints, list) and bool(keypoints) and len(keypoints) % 3 == 0
+        if valid and expected_count is not None:
+            valid = len(keypoints) == expected_count * 3
+        if valid:
+            valid_annotations.append(annotation)
+        else:
+            dropped_count += 1
+
+    if dropped_count:
+        coco_gt.dataset["annotations"] = valid_annotations
+        coco_gt.createIndex()
+        logger.warning(
+            "Skipped %d COCO annotation(s) without a valid category-sized keypoints vector during keypoint evaluation.",
+            dropped_count,
+        )
+
+
 def _infer_keypoint_count(coco_gt: COCO) -> int | None:
     """Infer a single keypoint count from COCO category metadata or annotations."""
     counts = {count for count in _infer_keypoint_counts_by_category(coco_gt).values() if count > 0}
@@ -353,6 +386,7 @@ class CocoEvaluator:
         resolved_keypoint_oks_sigmas = None
         keypoint_category_groups: list[_KeypointCategoryGroup] = []
         if "keypoints" in iou_types:
+            _filter_invalid_keypoint_annotations(coco_gt)
             _backfill_num_keypoints(coco_gt)
             keypoint_category_groups = _build_keypoint_category_groups(coco_gt, keypoint_oks_sigmas)
             if len(keypoint_category_groups) <= 1:
