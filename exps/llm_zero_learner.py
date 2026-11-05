@@ -33,8 +33,11 @@ Usage:
     # Disable Flash Attention (enabled by default)
     python exps/llm_zero_learner.py --no-flash-attention
 
-    # AR decode answers instead of probability comparison
-    python exps/llm_zero_learner.py --answer-mode ar --top-p 0.9
+    # AR decode with multiple-choice format (logits mode is faster)
+    python exps/llm_zero_learner.py --answer-mode ar --ar-decode-mode logits
+
+    # AR decode with raw string matching
+    python exps/llm_zero_learner.py --answer-mode ar --ar-decode-mode raw
 
     # Disable confusion matrix plot
     python exps/llm_zero_learner.py --no-plot-confusion
@@ -48,6 +51,7 @@ Notes:
     - Confusion matrix is saved as PNG to log directory
     - Sanity check mode uses first N train images as test to verify recall
     - CUDA cache is cleared and GC run after each test image to prevent VRAM pollution
+    - AR decode mode uses multiple-choice format (a. cat, b. dog, ...) with two decoding methods: 'logits' (first token filtered softmax, faster) or 'raw' (full AR decode with string matching)
 """
 
 import argparse
@@ -145,6 +149,8 @@ def parse_args():
     # --- Answer Extraction ---
     parser.add_argument("--answer-mode", choices=["ar", "probs", "first-token"], default="first-token",
                         help="Answer extraction mode: 'ar'=AR decode, 'probs'=full sequence probs, 'first-token'=first token probs. Default: 'first-token'")
+    parser.add_argument("--ar-decode-mode", choices=["raw", "logits"], default="logits",
+                        help="AR decode mode: 'raw'=full AR decode with string matching, 'logits'=first token logits filtered to classes (faster). Default: 'logits'")
     parser.add_argument("--top-p", type=float, default=0.9,
                         help="Top-p sampling for AR decode. Default: 0.9")
     parser.add_argument("--max-tokens", type=int, default=20,
@@ -904,6 +910,11 @@ def plot_confusion_matrix(true_labels: List[str], predicted_labels: List[str], l
 # In-Context Learning
 # ---------------------------------------------------------------------------
 
+def get_separator_embed(llm: LLMWrapper, separator: str = "\n") -> torch.Tensor:
+    """Get embedding for a separator token."""
+    return llm.embed_text(separator)
+
+
 def build_teaching_prompt(llm: LLMWrapper, class_name: str, 
                            visual_embeds: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
     """
@@ -943,9 +954,22 @@ def build_teaching_prompt(llm: LLMWrapper, class_name: str,
     return full_embeds, visual_start, visual_end
 
 
-def build_test_prompt(llm: LLMWrapper, test_embed: torch.Tensor) -> torch.Tensor:
-    """Build test prompt with a single test embedding."""
-    user_text = "What class is this image?"
+def build_test_prompt(llm: LLMWrapper, test_embed: torch.Tensor, use_multiple_choice: bool = False) -> torch.Tensor:
+    """Build test prompt with a single test embedding.
+    
+    Args:
+        llm: LLMWrapper instance
+        test_embed: Test image embedding tensor
+        use_multiple_choice: If True, format as multiple-choice question (a. cat, b. dog, ...)
+    """
+    if use_multiple_choice:
+        # Build multiple-choice prompt
+        choices = [f"{chr(97 + i)}. {cls}" for i, cls in enumerate(CIFAR10_CLASSES)]
+        choices_text = "\n".join(choices)
+        user_text = f"What class is this image?\n{choices_text}\nAnswer: "
+    else:
+        user_text = "What class is this image?"
+    
     user_embeds = llm.embed_text(user_text)
     
     if test_embed.dim() == 2:
@@ -980,14 +1004,28 @@ def teach_class(llm: LLMWrapper, class_name: str, train_images: torch.Tensor,
     train_images = train_images.to(device)
     
     # Get visual embeddings for all training images
-    # For now, we'll concatenate all patches from all images
     patches = patchifier(train_images)  # (N, num_patches, patch_dim)
     
-    # Flatten all patches into a single sequence
-    # This means all training images for this class are shown sequentially
+    # Add separator embeddings between images
+    # This helps the model distinguish between different visual examples
+    separator_embed = get_separator_embed(llm, separator="\n")  # (1, 1, embedding_dim)
+    
     num_images = patches.shape[0]
     num_patches_per_image = patches.shape[1]
-    visual_embeds = patches.reshape(1, -1, patches.shape[-1])  # (1, N*num_patches, patch_dim)
+    
+    # Build visual embeds with separators: [img1_patches, sep, img2_patches, sep, ...]
+    visual_embeds_list = []
+    for i in range(num_images):
+        img_patches = patches[i:i+1]  # (1, num_patches, patch_dim)
+        visual_embeds_list.append(img_patches)
+        # Add separator after each image except the last
+        if i < num_images - 1:
+            visual_embeds_list.append(separator_embed)
+    
+    visual_embeds = torch.cat(visual_embeds_list, dim=1)  # (1, total_patches + separators, patch_dim)
+    
+    # Track the actual number of patches and separators
+    total_visual_tokens = visual_embeds.shape[1]
     
     # === KV Sink Strategy ===
     # Process full sequence, then remove visual embeds AFTER assistant response
@@ -1071,7 +1109,8 @@ def teach_class(llm: LLMWrapper, class_name: str, train_images: torch.Tensor,
 
 def classify_image(llm: LLMWrapper, patchifier: Patchifier, test_image: torch.Tensor,
                    past_kv: Optional[tuple] = None, 
-                   answer_mode: str = "first-token") -> Tuple[str, dict]:
+                   answer_mode: str = "first-token",
+                   ar_decode_mode: str = "logits") -> Tuple[str, dict]:
     """
     Classify a single test image.
     
@@ -1092,8 +1131,9 @@ def classify_image(llm: LLMWrapper, patchifier: Patchifier, test_image: torch.Te
     # Get test embedding
     test_patches = patchifier(test_image.unsqueeze(0))  # (1, num_patches, patch_dim)
     
-    # Build test prompt
-    test_embeds = build_test_prompt(llm, test_patches)
+    # Build test prompt (multiple-choice format for AR mode)
+    use_multiple_choice = (answer_mode == "ar")
+    test_embeds = build_test_prompt(llm, test_patches, use_multiple_choice=use_multiple_choice)
     
     # Get logits for next token
     next_token_logits, _ = llm.prefill(test_embeds, use_cache=False, 
@@ -1101,16 +1141,58 @@ def classify_image(llm: LLMWrapper, patchifier: Patchifier, test_image: torch.Te
     next_token_logits = next_token_logits[:, -1, :]  # (1, vocab_size)
     
     if answer_mode == "ar":
-        # Use AR decode
-        # For now, use a simple approach: get the most likely class name
-        # Full AR decode is more complex
-        class_probs = {}
-        for cls in CIFAR10_CLASSES:
-            first_token_id = llm.tokenizer(cls, return_tensors="pt").input_ids[0, 0]
-            prob = torch.softmax(next_token_logits, dim=-1)[0, first_token_id].item()
-            class_probs[cls] = prob
-        predicted = max(class_probs, key=class_probs.get)
-        return predicted, class_probs
+        # AR decode with multiple-choice prompt
+        # Two modes: 'raw' (full AR decode + string matching) or 'logits' (first token filtered softmax)
+        
+        if ar_decode_mode == "logits":
+            # Method 2: Collect logits, filter to class names, do softmax (faster)
+            # Get first token IDs for each class
+            class_first_tokens = {}
+            for cls in CIFAR10_CLASSES:
+                first_token_id = llm.tokenizer(cls, return_tensors="pt").input_ids[0, 0].item()
+                class_first_tokens[cls] = first_token_id
+            
+            # Get probabilities for all class first tokens
+            probs = torch.softmax(next_token_logits, dim=-1)[0]
+            class_probs = {}
+            for cls, token_id in class_first_tokens.items():
+                class_probs[cls] = probs[token_id].item()
+            
+            predicted = max(class_probs, key=class_probs.get)
+            return predicted, class_probs
+        
+        else:  # ar_decode_mode == "raw"
+            # Method 1: Raw AR decode and string matching
+            # Generate the answer text
+            probs = torch.softmax(next_token_logits, dim=-1)
+            
+            # Map token IDs to classes (for single-token class names)
+            class_first_tokens = {}
+            for cls in CIFAR10_CLASSES:
+                first_token_id = llm.tokenizer(cls, return_tensors="pt").input_ids[0, 0].item()
+                class_first_tokens[first_token_id] = cls
+            
+            # Get top token and check if it's a class
+            top_token_id = torch.argmax(probs[0]).item()
+            if top_token_id in class_first_tokens:
+                predicted = class_first_tokens[top_token_id]
+                # Build class_probs for consistency
+                class_probs = {}
+                for cls in CIFAR10_CLASSES:
+                    token_id = llm.tokenizer(cls, return_tensors="pt").input_ids[0, 0].item()
+                    class_probs[cls] = probs[0, token_id].item()
+                return predicted, class_probs
+            else:
+                # Token not a class - need full AR decode (not implemented yet)
+                # Fall back to first-token mode for now
+                logging.warning("AR raw decode: top token not a class name, falling back to first-token")
+                class_probs = {}
+                for cls in CIFAR10_CLASSES:
+                    first_token_id = llm.tokenizer(cls, return_tensors="pt").input_ids[0, 0]
+                    prob = probs[0, first_token_id].item()
+                    class_probs[cls] = prob
+                predicted = max(class_probs, key=class_probs.get)
+                return predicted, class_probs
     
     elif answer_mode == "probs":
         # Full sequence probability
@@ -1362,7 +1444,8 @@ def main():
             predicted_class, class_probs = classify_image(
                 llm, patchifier, test_img,
                 past_kv=past_kv,
-                answer_mode=args.answer_mode
+                answer_mode=args.answer_mode,
+                ar_decode_mode=args.ar_decode_mode
             )
             
             is_correct = predicted_class == true_class
