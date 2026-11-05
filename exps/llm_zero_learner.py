@@ -39,6 +39,12 @@ Usage:
     # AR decode with raw string matching
     python exps/llm_zero_learner.py --answer-mode ar --ar-decode-mode raw
 
+    # Teaching modes:
+    # Minibatch per class (split one class into batches)
+    python exps/llm_zero_learner.py --teaching-mode minibatch-per-class --teaching-batch-size 2
+    # Minibatch mixed (mix multiple classes per batch)
+    python exps/llm_zero_learner.py --teaching-mode minibatch-mixed --teaching-batch-size 5
+
     # Disable confusion matrix plot
     python exps/llm_zero_learner.py --no-plot-confusion
 
@@ -52,6 +58,8 @@ Notes:
     - Sanity check mode uses first N train images as test to verify recall
     - CUDA cache is cleared and GC run after each test image to prevent VRAM pollution
     - AR decode mode uses multiple-choice format (a. cat, b. dog, ...) with two decoding methods: 'logits' (first token filtered softmax, faster) or 'raw' (full AR decode with string matching)
+    - Three teaching modes: 'full-batch-per-class' (default, all images of one class at once), 'minibatch-per-class' (split one class into batches), 'minibatch-mixed' (mix multiple classes per batch)
+    - KV sink works with all three teaching modes to manage memory
 """
 
 import argparse
@@ -155,6 +163,14 @@ def parse_args():
                         help="Top-p sampling for AR decode. Default: 0.9")
     parser.add_argument("--max-tokens", type=int, default=20,
                         help="Max tokens for AR decode. Default: 20")
+
+    # --- Teaching Mode ---
+    parser.add_argument("--teaching-mode", choices=["full-batch-per-class", "minibatch-per-class", "minibatch-mixed"], 
+                        default="full-batch-per-class",
+                        help="Teaching mode: 'full-batch-per-class'=all images of one class at once (default), \
+'minibatch-per-class'=split one class into smaller batches, 'minibatch-mixed'=mix multiple classes per batch")
+    parser.add_argument("--teaching-batch-size", type=int, default=5,
+                        help="Batch size for minibatch teaching modes. Default: 5")
 
     # --- Data ---
     parser.add_argument("--data-dir", type=str, default="./data",
@@ -982,9 +998,11 @@ def build_test_prompt(llm: LLMWrapper, test_embed: torch.Tensor, use_multiple_ch
     return full_embeds
 
 
-def teach_class(llm: LLMWrapper, class_name: str, train_images: torch.Tensor,
+def teach_full_batch_per_class(llm: LLMWrapper, class_name: str, train_images: torch.Tensor,
                 patchifier: Patchifier, use_kv_sink: bool = True,
                 past_key_values: Optional[tuple] = None) -> tuple:
+    """Mode 1: Teach all images of ONE class in a single batch (current behavior)."""
+
     """
     Teach the LLM a single class using in-context learning.
     
@@ -1105,6 +1123,198 @@ def teach_class(llm: LLMWrapper, class_name: str, train_images: torch.Tensor,
         # Keep full context including visuals
     
     return past_kv
+
+
+# ---------------------------------------------------------------------------
+# Teaching Mode 2: Minibatch Per Class
+# ---------------------------------------------------------------------------
+
+def teach_minibatch_per_class(llm: LLMWrapper, class_name: str, train_images: torch.Tensor,
+                              patchifier: Patchifier, use_kv_sink: bool = True,
+                              past_key_values: Optional[tuple] = None,
+                              batch_size: int = 5) -> tuple:
+    """Mode 2: Teach one class split into minibatches.
+    
+    Each minibatch contains multiple images from the SAME class.
+    Assistant confirms each batch.
+    """
+    device = next(patchifier.parameters()).device if patchifier.proj is not None else llm.device
+    train_images = train_images.to(device)
+    
+    num_images = train_images.shape[0]
+    num_batches = (num_images + batch_size - 1) // batch_size
+    
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, num_images)
+        batch_images = train_images[start_idx:end_idx]
+        
+        # Get patches for this batch
+        patches = patchifier(batch_images)  # (batch_size, num_patches, patch_dim)
+        
+        # Add separators between images in the batch
+        separator_embed = get_separator_embed(llm, separator="\n")
+        
+        # Build visual embeds with separators
+        visual_embeds_list = []
+        for i in range(patches.shape[0]):
+            img_patches = patches[i:i+1]
+            visual_embeds_list.append(img_patches)
+            if i < patches.shape[0] - 1:
+                visual_embeds_list.append(separator_embed)
+        visual_embeds = torch.cat(visual_embeds_list, dim=1)
+        visual_embeds = visual_embeds.to(llm.device)
+        model_dtype = next(llm.model.parameters()).dtype
+        visual_embeds = visual_embeds.to(model_dtype)
+        
+        # Build prompt
+        user_text = f"Class: {class_name}\nRemember these examples."
+        user_embeds = llm.embed_text(user_text)
+        user_seq_len = user_embeds.shape[1]
+        
+        # Process with KV sink
+        if use_kv_sink:
+            prev_len = get_kv_seq_len(past_key_values) if past_key_values else 0
+            full_embeds = torch.cat([user_embeds, visual_embeds], dim=1)
+            logits, past_kv = llm.prefill(full_embeds, use_cache=True, past_key_values=past_key_values)
+            
+            assistant_text = f"ok i learnt batch {batch_idx + 1} for class {class_name}"
+            assistant_embeds = llm.embed_text(assistant_text)
+            assistant_seq_len = assistant_embeds.shape[1]
+            logits, past_kv = llm.prefill(assistant_embeds, use_cache=True, past_key_values=past_kv)
+            
+            # Remove visual embeds from cache
+            vis_start = prev_len + user_seq_len
+            vis_end = prev_len + user_seq_len + visual_embeds.shape[1]
+            past_kv = remove_kv_range(past_kv, vis_start, vis_end)
+            
+            # Verify
+            expected_len = prev_len + user_seq_len + assistant_seq_len
+            actual_len = get_kv_seq_len(past_kv)
+            if actual_len != expected_len:
+                logging.warning(f"KV sink batch {batch_idx}: expected {expected_len}, got {actual_len}")
+            
+            if past_kv is None:
+                logging.warning(f"KV sink failed for batch {batch_idx}")
+                full_embeds_with_asst = torch.cat([user_embeds, visual_embeds, assistant_embeds], dim=1)
+                logits, past_kv = llm.prefill(full_embeds_with_asst, use_cache=True, past_key_values=past_key_values)
+        else:
+            # No KV sink
+            user_text_q = f"Class: {class_name}\nRemember these examples."
+            user_embeds_q = llm.embed_text(user_text_q)
+            full_embeds = torch.cat([user_embeds_q, visual_embeds.to(user_embeds_q.device)], dim=1)
+            logits, past_kv = llm.prefill(full_embeds, use_cache=True, past_key_values=past_key_values)
+            
+            assistant_text = f"ok i learnt batch {batch_idx + 1} for class {class_name}"
+            assistant_embeds = llm.embed_text(assistant_text)
+            logits, past_kv = llm.prefill(assistant_embeds, use_cache=True, past_key_values=past_kv)
+        
+        past_key_values = past_kv
+        logging.info(f"  Taught batch {batch_idx + 1}/{num_batches} for {class_name}")
+    
+    return past_key_values
+
+
+# ---------------------------------------------------------------------------
+# Teaching Mode 3: Minibatch Mixed
+# ---------------------------------------------------------------------------
+
+def teach_minibatch_mixed(llm: LLMWrapper, all_train_images_by_class: dict,
+                           patchifier: Patchifier, use_kv_sink: bool = True,
+                           past_key_values: Optional[tuple] = None,
+                           batch_size: int = 5) -> tuple:
+    """Mode 3: Teach mixed classes in minibatches.
+    
+    Each minibatch contains images from MULTIPLE classes.
+    Assistant summarizes each batch.
+    """
+    device = next(patchifier.parameters()).device if patchifier.proj is not None else llm.device
+    separator_embed = get_separator_embed(llm, separator="\n")
+    model_dtype = next(llm.model.parameters()).dtype
+    
+    # Flatten all images with their labels
+    all_images = []
+    all_labels = []
+    for class_name, images in all_train_images_by_class.items():
+        if len(images) > 0:
+            for img in images:
+                all_images.append(img.to(device))
+                all_labels.append(class_name)
+    
+    if len(all_images) == 0:
+        return past_key_values
+    
+    # Create minibatches
+    total_samples = len(all_images)
+    num_batches = (total_samples + batch_size - 1) // batch_size
+    
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, total_samples)
+        batch_images = all_images[start_idx:end_idx]
+        batch_labels = all_labels[start_idx:end_idx]
+        
+        # Stack and get patches
+        batch_images_tensor = torch.stack(batch_images)
+        patches = patchifier(batch_images_tensor)  # (batch_size, num_patches, patch_dim)
+        
+        # Build prompt with labels
+        batch_desc_parts = []
+        for i, (img_patches, label) in enumerate(zip(patches, batch_labels)):
+            batch_desc_parts.append(f"image {i+1} - {label}")
+        batch_desc = "\n".join(batch_desc_parts)
+        user_text = f"batch {batch_idx + 1}:\n{batch_desc}"
+        user_embeds = llm.embed_text(user_text)
+        
+        # Build visual embeds with separators
+        visual_embeds_list = []
+        for i in range(patches.shape[0]):
+            img_patches = patches[i:i+1]
+            visual_embeds_list.append(img_patches)
+            if i < patches.shape[0] - 1:
+                visual_embeds_list.append(separator_embed)
+        visual_embeds = torch.cat(visual_embeds_list, dim=1)
+        visual_embeds = visual_embeds.to(llm.device).to(model_dtype)
+        
+        # Process with KV sink
+        if use_kv_sink:
+            prev_len = get_kv_seq_len(past_key_values) if past_key_values else 0
+            full_embeds = torch.cat([user_embeds, visual_embeds], dim=1)
+            logits, past_kv = llm.prefill(full_embeds, use_cache=True, past_key_values=past_key_values)
+            
+            assistant_text = f"done batch {batch_idx + 1}"
+            assistant_embeds = llm.embed_text(assistant_text)
+            assistant_seq_len = assistant_embeds.shape[1]
+            logits, past_kv = llm.prefill(assistant_embeds, use_cache=True, past_key_values=past_kv)
+            
+            # Remove visual embeds from cache
+            vis_start = prev_len + user_embeds.shape[1]
+            vis_end = prev_len + user_embeds.shape[1] + visual_embeds.shape[1]
+            past_kv = remove_kv_range(past_kv, vis_start, vis_end)
+            
+            # Verify
+            expected_len = prev_len + user_embeds.shape[1] + assistant_seq_len
+            actual_len = get_kv_seq_len(past_kv)
+            if actual_len != expected_len:
+                logging.warning(f"KV sink batch {batch_idx}: expected {expected_len}, got {actual_len}")
+            
+            if past_kv is None:
+                logging.warning(f"KV sink failed for batch {batch_idx}")
+                full_embeds_with_asst = torch.cat([user_embeds, visual_embeds, assistant_embeds], dim=1)
+                logits, past_kv = llm.prefill(full_embeds_with_asst, use_cache=True, past_key_values=past_key_values)
+        else:
+            # No KV sink
+            full_embeds = torch.cat([user_embeds, visual_embeds.to(user_embeds.device)], dim=1)
+            logits, past_kv = llm.prefill(full_embeds, use_cache=True, past_key_values=past_key_values)
+            
+            assistant_text = f"done batch {batch_idx + 1}"
+            assistant_embeds = llm.embed_text(assistant_text)
+            logits, past_kv = llm.prefill(assistant_embeds, use_cache=True, past_key_values=past_kv)
+        
+        past_key_values = past_kv
+        logging.info(f"  Taught minibatch {batch_idx + 1}/{num_batches} (mixed classes)")
+    
+    return past_key_values
 
 
 def classify_image(llm: LLMWrapper, patchifier: Patchifier, test_image: torch.Tensor,
@@ -1379,28 +1589,76 @@ def main():
     
     # Teach each class
     past_kv = None
-    for class_idx, class_name in enumerate(CIFAR10_CLASSES):
-        images = train_by_class[class_name]
-        if len(images) == 0:
-            logging.warning(f"No training images for class: {class_name}")
-            continue
-        
-        prev_len = get_kv_seq_len(past_kv)
-        logging.info(f"\nTeaching class: {class_name} ({len(images)} examples), previous cache: {prev_len} tokens")
+    
+    if args.teaching_mode == "full-batch-per-class":
+        # Mode 1: All images of one class in a single batch (original)
+        for class_idx, class_name in enumerate(CIFAR10_CLASSES):
+            images = train_by_class[class_name]
+            if len(images) == 0:
+                logging.warning(f"No training images for class: {class_name}")
+                continue
+            
+            prev_len = get_kv_seq_len(past_kv)
+            logging.info(f"\nTeaching class: {class_name} ({len(images)} examples), previous cache: {prev_len} tokens")
+            
+            try:
+                past_kv = teach_full_batch_per_class(
+                    llm, class_name, images,
+                    patchifier, use_kv_sink=args.use_kv_sink,
+                    past_key_values=past_kv
+                )
+                new_len = get_kv_seq_len(past_kv)
+                logging.info(f"  -> Successfully taught {class_name}, cache now: {new_len} tokens")
+            except Exception as e:
+                logging.error(f"  -> Error teaching {class_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+    
+    elif args.teaching_mode == "minibatch-per-class":
+        # Mode 2: Split each class into minibatches
+        for class_idx, class_name in enumerate(CIFAR10_CLASSES):
+            images = train_by_class[class_name]
+            if len(images) == 0:
+                logging.warning(f"No training images for class: {class_name}")
+                continue
+            
+            prev_len = get_kv_seq_len(past_kv)
+            logging.info(f"\nTeaching class: {class_name} ({len(images)} examples in batches of {args.teaching_batch_size}), previous cache: {prev_len} tokens")
+            
+            try:
+                past_kv = teach_minibatch_per_class(
+                    llm, class_name, images,
+                    patchifier, use_kv_sink=args.use_kv_sink,
+                    past_key_values=past_kv,
+                    batch_size=args.teaching_batch_size
+                )
+                new_len = get_kv_seq_len(past_kv)
+                logging.info(f"  -> Successfully taught {class_name} in minibatches, cache now: {new_len} tokens")
+            except Exception as e:
+                logging.error(f"  -> Error teaching {class_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+    
+    elif args.teaching_mode == "minibatch-mixed":
+        # Mode 3: Mix all classes into minibatches
+        logging.info(f"\nTeaching with mixed minibatches (size={args.teaching_batch_size})")
         
         try:
-            past_kv = teach_class(
-                llm, class_name, images,
+            past_kv = teach_minibatch_mixed(
+                llm, train_by_class,
                 patchifier, use_kv_sink=args.use_kv_sink,
-                past_key_values=past_kv
+                past_key_values=past_kv,
+                batch_size=args.teaching_batch_size
             )
             new_len = get_kv_seq_len(past_kv)
-            logging.info(f"  -> Successfully taught {class_name}, cache now: {new_len} tokens")
+            logging.info(f"  -> Successfully taught all classes in mixed minibatches, cache now: {new_len} tokens")
         except Exception as e:
-            logging.error(f"  -> Error teaching {class_name}: {e}")
+            logging.error(f"  -> Error in mixed minibatch teaching: {e}")
             import traceback
             traceback.print_exc()
-            break
+            past_kv = None
     
     if past_kv is None:
         logging.error("No classes were taught successfully. Exiting.")
@@ -1422,12 +1680,27 @@ def main():
         cls = CIFAR10_CLASSES[label]
         test_by_class[cls].append((img, label))
     
-    # Flatten for iteration
+    # Flatten for iteration and track paths
     test_images = []
     test_labels = []
-    for cls in CIFAR10_CLASSES:
-        test_images.extend([img for img, _ in test_by_class[cls]])
-        test_labels.extend([label for _, label in test_by_class[cls]])
+    test_paths = []  # Track paths for each test image
+    
+    if args.save_images:
+        # Build paths in the same order as test_images
+        for cls in CIFAR10_CLASSES:
+            class_images = [img for img, _ in test_by_class[cls]]
+            test_images.extend(class_images)
+            test_labels.extend([CIFAR10_CLASSES.index(cls) for _ in class_images])
+            # Generate expected paths: test_{class}_{index}.png
+            for i in range(len(class_images)):
+                path = str(args.images_dir / f"test_{cls}_{i:04d}.png")
+                test_paths.append(path)
+    else:
+        # No paths available, use empty list
+        for cls in CIFAR10_CLASSES:
+            test_images.extend([img for img, _ in test_by_class[cls]])
+            test_labels.extend([label for _, label in test_by_class[cls]])
+            test_paths.extend([None] * len(test_by_class[cls]))
     
     # Test each image
     correct = 0
@@ -1439,6 +1712,7 @@ def main():
     
     for test_idx, (test_img, true_label) in enumerate(zip(test_images, test_labels)):
         true_class = CIFAR10_CLASSES[true_label]
+        test_path = test_paths[test_idx] if test_idx < len(test_paths) else None
         
         try:
             predicted_class, class_probs = classify_image(
@@ -1456,7 +1730,8 @@ def main():
             all_true_labels.append(true_class)
             all_predicted_labels.append(predicted_class)
             
-            logging.info(f"\nTest {test_idx + 1}/{total}:")
+            path_str = f"\n  Path: {test_path}" if test_path else ""
+            logging.info(f"\nTest {test_idx + 1}/{total}:{path_str}")
             logging.info(f"  True: {true_class}")
             logging.info(f"  Predicted: {predicted_class} {'✓' if is_correct else '✗'}")
             
