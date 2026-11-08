@@ -44,6 +44,7 @@ import argparse
 import ast
 import gc
 import logging
+import random
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1001,6 +1002,19 @@ class ClassNaming:
     def id(self, name: str) -> int:
         return self._name_to_id[name]
 
+    def display_name(self, name_or_id: Union[str, int]) -> str:
+        """Return display name; in generic mode, also prints the original class name if known."""
+        if isinstance(name_or_id, int):
+            cid = name_or_id
+            cname = self.name(cid)
+        else:
+            cname = name_or_id
+            cid = self._name_to_id.get(cname, None)
+
+        if self.use_generic and cid is not None and 0 <= cid < len(self.classes):
+            return f"{cname} ({self.classes[cid]})"
+        return cname
+
     @property
     def names(self) -> List[str]:
         return [self._id_to_name[i] for i in range(len(self.classes))]
@@ -1017,6 +1031,20 @@ class PromptConfig:
 
     Template variables: {class_name}, {class_names_list}
     """
+    # First-round instruction / system setup turn
+    instruction_user_prompt: str = (
+        "You are a large language model. You were never trained on images directly, "
+        "but in this session you will perform in-context learning analogous to deep neural network "
+        "SGD classification training, assisted by a KV cache compression algorithm.\n"
+        "Because earlier KV cache entries are dynamically removed, your self-attention at recent "
+        "timesteps may not attend back to all earlier inputs.\n\n"
+        "In each turn, you will be given a batch of image patch vectors and label pairs. "
+        "Respond in a way that consolidates memory.\n\n"
+        "At the end of training, there will be test images unseen during in-context learning."
+    )
+    instruction_asst_prompt: str = "Understood."
+    use_instruction_turn: bool = True
+
     # Teaching (one-class mode)
     teach_user_tmpl: str  = "Here are examples of {class_name}."
     teach_asst_tmpl: str  = "Understood. I have memorized {class_name}."
@@ -1046,6 +1074,31 @@ DEFAULT_PROMPT_CFG = PromptConfig()
 # ---------------------------------------------------------------------------
 # 9. Teaching Functions
 # ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def prefill_instruction(
+    llm: LLMWrapper,
+    builder: EmbedBuilder,
+    past_kv,
+    cfg: PromptConfig = DEFAULT_PROMPT_CFG,
+) -> Tuple[object, Dict]:
+    """
+    Prefill the first-round instruction turn (user instruction + assistant response).
+    This establishes task context before any image training data is ingested.
+    """
+    turn_emb, positions = builder.build_teaching_turn(
+        user_text=cfg.instruction_user_prompt,
+        visual_embeds=None,
+        assistant_text=cfg.instruction_asst_prompt,
+        is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
+    )
+    prev_len = kv_seq_len(past_kv)
+    logits, past_kv, _ = llm.prefill(turn_emb, past_kv=past_kv, use_cache=True)
+    full_len = kv_seq_len(past_kv)
+    return past_kv, {
+        "tokens_added": full_len - prev_len,
+    }
+
 
 @torch.no_grad()
 def teach_one_class(
@@ -1199,18 +1252,24 @@ def teach_guess_correct(
     past_kv,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     is_first_turn: bool = False,
+    guess_prob_gt: float = 0.0,
+    guess_prob_random: float = 0.0,
 ) -> Tuple[object, bool, str]:
     """
     'guess-correct' mode for a single image.
 
     Dialogue (all within one accumulated KV):
         [turn 1] user: <visual embed>
-                 assistant: <model's argmax prediction>
+                 assistant: <model's guess>
         [turn 2] user: <true class name>
                  assistant: "correct, <class>" or "wrong, it is <class>"
 
+    Guess mode flags:
+        guess_prob_gt: probability of assistant guessing true ground truth instead of argmax (0=argmax, 1=always true)
+        guess_prob_random: probability of assistant guessing random label instead of argmax (0=argmax, 1=always random)
+
     Returns:
-        (past_kv, was_correct, predicted_class_name)
+        (past_kv, was_correct, guessed_class_name)
     """
     device = llm.device
     dtype  = llm.model_dtype
@@ -1225,15 +1284,25 @@ def teach_guess_correct(
     )
     logits, past_kv_q, _ = llm.prefill(q_emb, past_kv=past_kv, use_cache=True)
     next_logits = logits[0, -1, :]      # (vocab_size,)
-    predicted_name = _argmax_class(llm, next_logits, class_naming)
+    argmax_name = _argmax_class(llm, next_logits, class_naming)
 
-    # Append predicted_name as assistant response
-    pred_emb = llm.embed_text(predicted_name + builder.chat.asst_tail)
+    # Decide assistant guess:
+    # 1. guess_prob_gt: interpolate between argmax and always true GT
+    # 2. guess_prob_random: interpolate between argmax and always random label
+    if guess_prob_gt > 0.0 and random.random() < guess_prob_gt:
+        guessed_name = true_class_name
+    elif guess_prob_random > 0.0 and random.random() < guess_prob_random:
+        guessed_name = random.choice(class_naming.names)
+    else:
+        guessed_name = argmax_name
+
+    # Append guessed_name as assistant response
+    pred_emb = llm.embed_text(guessed_name + builder.chat.asst_tail)
     pred_emb = pred_emb.to(device=device, dtype=dtype)
     _, past_kv_q, _ = llm.prefill(pred_emb, past_kv=past_kv_q, use_cache=True)
 
     # -- Turn 2: user reveals true label, assistant acknowledges --
-    was_correct = (predicted_name == true_class_name)
+    was_correct = (guessed_name == true_class_name)
     if was_correct:
         asst_feedback = cfg.guess_correct_asst.format(class_name=true_class_name)
     else:
@@ -1247,7 +1316,7 @@ def teach_guess_correct(
     )
     _, past_kv_q, _ = llm.prefill(fb_emb, past_kv=past_kv_q, use_cache=True)
 
-    return past_kv_q, was_correct, predicted_name
+    return past_kv_q, was_correct, guessed_name
 
 
 # ---------------------------------------------------------------------------
@@ -1412,7 +1481,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="LLM Learner")
 
     # Model
-    p.add_argument("--model-name", default="HuggingFaceTB/SmolLM-135M",
+    # Qwen/Qwen3-0.6B
+    # Qwen/Qwen3-1.7B
+    # Qwen/Qwen3-4B
+    # Qwen/Qwen3-8B
+    # HuggingFaceTB/SmolLM-135M
+    # HuggingFaceTB/SmolLM3-3B
+    p.add_argument("--model-name", default="HuggingFaceTB/SmolLM3-3B",
                    help="HuggingFace model name")
     p.add_argument("--device", default=None,
                    help="cuda / cpu / None (auto)")
@@ -1425,17 +1500,17 @@ def parse_args():
 
     # Image tokenizer
     p.add_argument("--patch-size", type=int, default=16)
-    p.add_argument("--img-mode", choices=["floats", "byte_embeds"], default="floats")
+    p.add_argument("--img-mode", choices=["floats", "byte_embeds"], default="byte_embeds")
     p.add_argument("--img-reduction", choices=["random_proj", "sum", "avg"],
                    default="random_proj",
                    help="Patch reduction method")
 
     # KV cache compression
     p.add_argument("--kv-policy", choices=["noop", "streaming", "attn_query"],
-                   default="noop")
+                   default="attn_query")
     p.add_argument("--kv-sink", type=int, default=4,
                    help="StreamingLLM: number of sink tokens")
-    p.add_argument("--kv-last", type=int, default=64,
+    p.add_argument("--kv-last", type=int, default=512,
                    help="StreamingLLM: number of recent tokens to keep")
     p.add_argument("--kv-topk", type=int, default=128,
                    help="AttentionQuery: top-k positions to keep")
@@ -1449,26 +1524,33 @@ def parse_args():
     # Input / teaching mode
     p.add_argument("--input-mode",
                    choices=["one-class", "mixed", "guess-correct"],
-                   default="one-class")
-    p.add_argument("--train-per-class", type=int, default=5,
+                   default="mixed")
+    p.add_argument("--train-per-class", type=int, default=100,
                    help="Training images per class")
-    p.add_argument("--test-per-class", type=int, default=1,
+    p.add_argument("--test-per-class", type=int, default=10,
                    help="Test images per class")
-    p.add_argument("--teaching-epochs", type=int, default=1,
+    p.add_argument("--teaching-epochs", type=int, default=2,
                    help="Number of teaching passes over training data")
-    p.add_argument("--batch-size", type=int, default=5,
+    p.add_argument("--batch-size", type=int, default=10,
                    help="Images per teaching batch (for mixed mode)")
+    p.add_argument("--guess-prob-gt", type=float, default=0.9,
+                   help="Probability of assistant guessing true ground truth instead of argmax (0=argmax, 1=always true GT)")
+    p.add_argument("--guess-prob-random", type=float, default=0.1,
+                   help="Probability of assistant guessing random label instead of argmax (0=argmax, 1=always random)")
 
     # Class names
     p.add_argument("--generic-class-names", action="store_true", default=False,
+    # p.add_argument("--generic-class-names", action="store_true", default=False,
                    help="Use class1, class2, ... instead of real names")
+    p.add_argument("--disable-instruction", action="store_true", default=False,
+                   help="Disable the first-round instruction prompt turn")
 
     # Classification
     p.add_argument("--answer-mode", choices=["first_token", "full_prob"],
-                   default="first_token")
+                   default="full_prob")
 
     # Data / logging
-    p.add_argument("--data-dir", default="./data")
+    p.add_argument("--data-dir", default="./datasets")
     p.add_argument("--log-dir", default="./logs")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -1572,7 +1654,11 @@ def main():
     # Class naming
     # -------------------------------------------------------------------
     class_naming = ClassNaming(CIFAR10_CLASSES, use_generic=args.generic_class_names)
-    logging.info(f"Class names: {class_naming.names}")
+    if class_naming.use_generic:
+        mapping_str = ", ".join(f"{class_naming.name(i)}: {class_naming.original(i)}" for i in range(len(CIFAR10_CLASSES)))
+        logging.info(f"Class names (generic mode): {mapping_str}")
+    else:
+        logging.info(f"Class names: {class_naming.names}")
 
     # -------------------------------------------------------------------
     # LLM
@@ -1634,6 +1720,14 @@ def main():
 
     past_kv    = None
     prompt_cfg = DEFAULT_PROMPT_CFG
+    if args.disable_instruction:
+        prompt_cfg.use_instruction_turn = False
+
+    if prompt_cfg.use_instruction_turn and prompt_cfg.instruction_user_prompt:
+        logging.info("Prefilling first-round instruction prompt...")
+        past_kv, info = prefill_instruction(llm, builder, past_kv, cfg=prompt_cfg)
+        logging.info(f"  -> Instruction prefilled (+{info['tokens_added']} tokens), "
+                     f"cache now: {kv_seq_len(past_kv)} tokens")
 
     for epoch in range(args.teaching_epochs):
         logging.info(f"\n-- Epoch {epoch + 1}/{args.teaching_epochs} --")
@@ -1642,13 +1736,14 @@ def main():
             # Teach one class at a time (all images of that class together)
             for cls_id, cls_name_orig in enumerate(CIFAR10_CLASSES):
                 cls_name = class_naming.name(cls_id)
+                cls_disp = class_naming.display_name(cls_id)
                 images   = train_by_class[cls_id]
                 if not images:
                     continue
 
                 images_tensor = torch.stack(images)   # (N, C, H, W)
                 prev_len = kv_seq_len(past_kv)
-                logging.info(f"  Teaching '{cls_name}' ({len(images)} imgs), "
+                logging.info(f"  Teaching '{cls_disp}' ({len(images)} imgs), "
                              f"cache={prev_len}")
 
                 past_kv, info = teach_one_class(
@@ -1658,7 +1753,7 @@ def main():
                     past_kv=past_kv,
                     compressor=compressor,
                     cfg=prompt_cfg,
-                    is_first_turn=(epoch == 0 and cls_id == 0),
+                    is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
                 )
                 logging.info(f"    -> +{info['tokens_added']} tokens, "
                              f"cache after compress: {info['tokens_after_compress']}")
@@ -1678,7 +1773,7 @@ def main():
             all_imgs_s, all_lbls_s = zip(*pairs) if pairs else ([], [])
 
             bs = args.batch_size
-            is_first = (epoch == 0)
+            is_first = (past_kv is None or kv_seq_len(past_kv) == 0)
             for i in range(0, len(all_imgs_s), bs):
                 b_imgs = list(all_imgs_s[i:i+bs])
                 b_lbls = list(all_lbls_s[i:i+bs])
@@ -1701,20 +1796,24 @@ def main():
                     all_cls_ids.append(cls_id)
 
             correct_count = 0
-            is_first = (epoch == 0)
+            is_first = (past_kv is None or kv_seq_len(past_kv) == 0)
             for i, (img, cls_id) in enumerate(zip(all_imgs, all_cls_ids)):
                 cls_name = class_naming.name(cls_id)
                 past_kv, was_correct, predicted = teach_guess_correct(
                     llm, builder, img_tok, img, cls_name, class_naming,
                     past_kv, cfg=prompt_cfg,
                     is_first_turn=(is_first and i == 0),
+                    guess_prob_gt=args.guess_prob_gt,
+                    guess_prob_random=args.guess_prob_random,
                 )
                 correct_count += int(was_correct)
                 if (i + 1) % 10 == 0 or i == 0:
                     acc = correct_count / (i + 1) * 100
+                    true_disp = class_naming.display_name(cls_id)
+                    pred_disp = class_naming.display_name(predicted)
                     logging.info(
                         f"  img {i+1}/{len(all_imgs)}: "
-                        f"true={cls_name}, pred={predicted} "
+                        f"true={true_disp}, pred={pred_disp} "
                         f"{'✓' if was_correct else '✗'} "
                         f"(running acc={acc:.1f}%, cache={kv_seq_len(past_kv)})"
                     )
@@ -1761,8 +1860,10 @@ def main():
             all_true.append(cls_name)
             all_pred.append(pred_name)
 
+            true_disp = class_naming.display_name(cls_id)
+            pred_disp = class_naming.display_name(pred_name)
             logging.info(
-                f"  [{total:4d}] true={cls_name:12s} pred={pred_name:12s} "
+                f"  [{total:4d}] true={true_disp:20s} pred={pred_disp:20s} "
                 f"{'✓' if is_ok else '✗'}"
             )
             if args.log_level == "DEBUG":
@@ -1795,17 +1896,22 @@ def main():
     for t, p in zip(all_true, all_pred):
         class_total[t]   = class_total.get(t, 0) + 1
         class_correct[t] = class_correct.get(t, 0) + int(t == p)
-    for name in class_naming.names:
+    for cls_id in range(len(class_naming.classes)):
+        name = class_naming.name(cls_id)
+        disp = class_naming.display_name(cls_id)
         n = class_total.get(name, 0)
         c = class_correct.get(name, 0)
         bar = "█" * c + "░" * (n - c)
-        logging.info(f"  {name:12s}: {c}/{n}  {bar}")
+        logging.info(f"  {disp:20s}: {c}/{n}  {bar}")
 
     # Confusion matrix
     if not args.no_confusion and HAS_MATPLOTLIB:
         try:
+            disp_true = [class_naming.display_name(t) for t in all_true]
+            disp_pred = [class_naming.display_name(p) for p in all_pred]
+            disp_classes = [class_naming.display_name(i) for i in range(len(class_naming.classes))]
             plot_confusion_matrix(
-                all_true, all_pred, class_naming.names,
+                disp_true, disp_pred, disp_classes,
                 log_dir / "confusion_matrix.png",
             )
         except Exception as e:
