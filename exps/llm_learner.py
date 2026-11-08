@@ -37,9 +37,18 @@ Usage
 # HuggingFaceTB/SmolLM3-3B
 
 python exps/llm_learner.py --generic-class-names --model-name HuggingFaceTB/SmolLM3-3B \
---img-mode byte_embeds --img-reduction sum --patch-size 8 \
---kv-policy attn_query kv-topk 128 --neighbor-window 1 1 \
---attractor-round assistant --attractor-temporary
+--img-mode byte_embeds --img-reduction sum --patch-size 16 \
+--kv-policy attn_query --kv-sink 512 --kv-topk 2048 --neighbor-window 1 1 \
+--attractor-round turn_tail --attractor-temporary \
+--train-per-class 100 --test-per-class 10 \
+--teaching-epochs 2 --batch-size 10 \
+--eval-every 1 --train-eval-per-class 10 \
+--answer-mode first_token \
+--eval-every 1 --train-eval-per-class 10 \
+--input-mode mixed
+
+--input-mode guess-correct \
+--guess-prob-gt 0.5 --guess-prob-random 0.5 \
 
 python exps/llm_learner.py --model-name Qwen/Qwen3-0.6B
 python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B
@@ -54,6 +63,7 @@ python exps/llm_learner.py --config exps/configs/llm_learner_config.py
 
 import argparse
 import ast
+import csv
 import gc
 import logging
 import random
@@ -67,6 +77,7 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
+from tqdm import tqdm
 
 try:
     import matplotlib
@@ -448,14 +459,13 @@ class LLMWrapper:
 
         logging.info(f"Loading tokenizer: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-
         logging.info(f"Loading model: {model_name} -> {self.device}")
         load_kwargs: Dict = {}
         if attn_implementation is not None:
             load_kwargs["attn_implementation"] = attn_implementation
         if torch_dtype is not None:
             load_kwargs["torch_dtype"] = torch_dtype
-
+        load_kwargs["attn_implementation"] = "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name, **load_kwargs
         ).to(self.device)
@@ -1442,6 +1452,8 @@ def teach_mixed(
     )
 
     abs_vis = (prev_len + vis_start, prev_len + vis_end)
+    if need_attn:
+        assert attn_maps is not None
     past_kv = compress_kv(
         past_kv, compressor, llm, builder, class_naming,
         data_range=abs_vis, cfg=cfg, in_turn_attentions=attn_maps
@@ -1635,6 +1647,98 @@ def _sequence_log_prob(llm: LLMWrapper, text: str, ctx_kv) -> float:
     return log_p
 
 
+@torch.no_grad()
+def evaluate_dataset(
+    llm: LLMWrapper,
+    builder: EmbedBuilder,
+    img_tok: ImageTokenizer,
+    data_by_class: Dict[int, List[torch.Tensor]],
+    class_naming: ClassNaming,
+    past_kv,
+    cfg: PromptConfig = DEFAULT_PROMPT_CFG,
+    answer_mode: str = "first_token",
+    verbose: bool = False,
+    desc: str = "Evaluating",
+) -> Tuple[float, List[str], List[str]]:
+    """
+    Evaluate classification accuracy over a dataset dictionary mapping class_id -> list of images.
+
+    Parameters
+    ----------
+    llm           : LLMWrapper instance
+    builder       : EmbedBuilder instance
+    img_tok       : ImageTokenizer instance
+    data_by_class : Dict[class_id, List[torch.Tensor]]
+    class_naming  : ClassNaming instance
+    past_kv       : Accumulated KV cache
+    cfg           : PromptConfig
+    answer_mode   : 'first_token' or 'full_prob'
+    verbose       : If True, log every single image classification
+    desc          : Progress bar description
+
+    Returns
+    -------
+    (accuracy_percentage, all_true_names, all_pred_names)
+    """
+    total_imgs = sum(len(imgs) for imgs in data_by_class.values())
+    if total_imgs == 0:
+        return 0.0, [], []
+
+    all_true: List[str] = []
+    all_pred: List[str] = []
+    correct = 0
+    count = 0
+
+    pbar = tqdm(total=total_imgs, desc=desc, leave=False, dynamic_ncols=True)
+    for cls_id in range(len(class_naming.classes)):
+        cls_name = class_naming.name(cls_id)
+        images = data_by_class.get(cls_id, [])
+        for img_idx, img in enumerate(images):
+            try:
+                pred_name, scores = classify_image(
+                    llm, builder, img_tok, img,
+                    class_naming=class_naming,
+                    past_kv=past_kv,
+                    cfg=cfg,
+                    answer_mode=answer_mode,
+                )
+            except Exception as e:
+                logging.error(f"Error classifying {cls_name} img {img_idx}: {e}")
+                pred_name = class_naming.names[0]
+                scores = {}
+
+            is_ok = (pred_name == cls_name)
+            correct += int(is_ok)
+            count += 1
+            all_true.append(cls_name)
+            all_pred.append(pred_name)
+
+            pbar.update(1)
+            pbar.set_postfix({
+                "acc": f"{100.0 * correct / count:.1f}%",
+                "corr": f"{correct}/{count}",
+            })
+
+            if verbose:
+                true_disp = class_naming.display_name(cls_id)
+                pred_disp = class_naming.display_name(pred_name)
+                logging.info(
+                    f"  [{count:4d}] true={true_disp:20s} pred={pred_disp:20s} "
+                    f"{'✓' if is_ok else '✗'}"
+                )
+                if scores:
+                    top = sorted(scores.items(), key=lambda x: -x[1])[:5]
+                    logging.debug(f"    top-5: {top}")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+    pbar.close()
+    accuracy = 100.0 * correct / total_imgs if total_imgs > 0 else 0.0
+    return accuracy, all_true, all_pred
+
+
 # ---------------------------------------------------------------------------
 # 11. Dataset Utilities
 # ---------------------------------------------------------------------------
@@ -1723,8 +1827,6 @@ def parse_args():
                    default="attn_query")
     p.add_argument("--kv-sink", type=int, default=4,
                    help="StreamingLLM: number of sink tokens")
-    p.add_argument("--kv-last", type=int, default=512,
-                   help="StreamingLLM: number of recent tokens to keep")
     p.add_argument("--kv-topk", type=int, default=128,
                    help="AttentionQuery: top-k positions to keep")
     p.add_argument("--attractor-range", type=int, nargs=2, default=[-10, -1],
@@ -1759,17 +1861,26 @@ def parse_args():
                    help="Probability of assistant guessing true ground truth instead of argmax (0=argmax, 1=always true GT)")
     p.add_argument("--guess-prob-random", type=float, default=0.1,
                    help="Probability of assistant guessing random label instead of argmax (0=argmax, 1=always random)")
+    p.add_argument("--eval-every", type=int, default=1,
+                   help="Evaluate validation/test accuracy every N epochs (and at the final epoch)")
+    p.add_argument("--train-eval-per-class", type=int, default=None,
+                   help="Number of training images per class to evaluate train accuracy (default: min(train_per_class, test_per_class))")
+    p.add_argument("--skip-val", action="store_true", default=False,
+                   help="Skip validation/test evaluation passes")
+    p.add_argument("--sanity-check", action="store_true", default=False,
+                   help="Sanity check mode: evaluate on training images (first --test-per-class per class) to test recall")
+    p.add_argument("--verbose", action="store_true", default=False,
+                   help="Enable verbose per-image logging during evaluation and teaching")
 
     # Class names
     p.add_argument("--generic-class-names", action="store_true", default=False,
-    # p.add_argument("--generic-class-names", action="store_true", default=False,
                    help="Use class1, class2, ... instead of real names")
     p.add_argument("--disable-instruction", action="store_true", default=False,
                    help="Disable the first-round instruction prompt turn")
 
     # Classification
     p.add_argument("--answer-mode", choices=["first_token", "full_prob"],
-                   default="full_prob")
+                   default="first_token")
 
     # Data / logging
     p.add_argument("--data-dir", default="./datasets")
@@ -1864,13 +1975,40 @@ def main():
     # -------------------------------------------------------------------
     logging.info("\nLoading CIFAR-10 ...")
     train_ds = load_cifar10(args.data_dir, train=True)
-    test_ds  = load_cifar10(args.data_dir, train=False)
-
     train_by_class = subset_per_class(train_ds, args.train_per_class)
-    test_by_class  = subset_per_class(test_ds,  args.test_per_class)
 
-    logging.info(f"  Train: {sum(len(v) for v in train_by_class.values())} images")
-    logging.info(f"  Test:  {sum(len(v) for v in test_by_class.values())} images")
+    # Train evaluation subset (for tracking train acc across epochs)
+    train_eval_n = (
+        args.train_eval_per_class
+        if args.train_eval_per_class is not None
+        else min(args.train_per_class, args.test_per_class)
+    )
+    train_eval_by_class = {
+        cls_id: imgs[:train_eval_n]
+        for cls_id, imgs in train_by_class.items()
+    } if train_eval_n > 0 else {}
+
+    # Validation/Test dataset
+    if args.skip_val:
+        logging.info("Validation evaluation is skipped (--skip-val)")
+        test_by_class = {}
+    elif args.sanity_check:
+        logging.info(f"SANITY CHECK MODE: Testing on training images (first {args.test_per_class} per class)")
+        test_by_class = {
+            cls_id: imgs[:args.test_per_class]
+            for cls_id, imgs in train_by_class.items()
+        }
+    else:
+        test_ds  = load_cifar10(args.data_dir, train=False)
+        test_by_class = subset_per_class(test_ds, args.test_per_class)
+
+    n_train_total = sum(len(v) for v in train_by_class.values())
+    n_train_eval_total = sum(len(v) for v in train_eval_by_class.values())
+    n_test_total = sum(len(v) for v in test_by_class.values())
+
+    logging.info(f"  Train:      {n_train_total} images")
+    logging.info(f"  Train-Eval: {n_train_eval_total} images")
+    logging.info(f"  Val/Test:   {n_test_total} images" + (" (sanity check: from train)" if args.sanity_check else (" (skipped)" if args.skip_val else "")))
 
     # -------------------------------------------------------------------
     # Class naming
@@ -1923,7 +2061,7 @@ def main():
         compressor = NoopCompressor()
     elif args.kv_policy == "streaming":
         compressor = StreamingLLMCompressor(
-            num_sink=args.kv_sink, keep_last=args.kv_last
+            num_sink=args.kv_sink, keep_last=args.kv_topk
         )
     elif args.kv_policy == "attn_query":
         compressor = AttentionQueryCompressor(
@@ -1960,12 +2098,17 @@ def main():
         logging.info(f"  -> Instruction prefilled (+{info['tokens_added']} tokens), "
                      f"cache now: {kv_seq_len(past_kv)} tokens")
 
-    for epoch in range(args.teaching_epochs):
-        logging.info(f"\n-- Epoch {epoch + 1}/{args.teaching_epochs} --")
+    history: List[Dict] = []
+    last_val_true: List[str] = []
+    last_val_pred: List[str] = []
+
+    epoch_pbar = tqdm(range(1, args.teaching_epochs + 1), desc="Epochs", dynamic_ncols=True)
+    for epoch in epoch_pbar:
+        logging.info(f"\n-- Epoch {epoch}/{args.teaching_epochs} --")
 
         if args.input_mode == "one-class":
-            # Teach one class at a time (all images of that class together)
-            for cls_id, cls_name_orig in enumerate(CIFAR10_CLASSES):
+            class_pbar = tqdm(range(len(CIFAR10_CLASSES)), desc=f"Ep {epoch} Teaching", leave=False, dynamic_ncols=True)
+            for cls_id in class_pbar:
                 cls_name = class_naming.name(cls_id)
                 cls_disp = class_naming.display_name(cls_id)
                 images   = train_by_class[cls_id]
@@ -1974,8 +2117,8 @@ def main():
 
                 images_tensor = torch.stack(images)   # (N, C, H, W)
                 prev_len = kv_seq_len(past_kv)
-                logging.info(f"  Teaching '{cls_disp}' ({len(images)} imgs), "
-                             f"cache={prev_len}")
+                if args.verbose:
+                    logging.info(f"  Teaching '{cls_disp}' ({len(images)} imgs), cache={prev_len}")
 
                 past_kv, info = teach_one_class(
                     llm, builder, img_tok,
@@ -1987,12 +2130,12 @@ def main():
                     is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
                     class_naming=class_naming,
                 )
-                logging.info(f"    -> +{info['tokens_added']} tokens, "
-                             f"cache after compress: {info['tokens_after_compress']}")
+                if args.verbose:
+                    logging.info(f"    -> +{info['tokens_added']} tokens, "
+                                 f"cache after compress: {info['tokens_after_compress']}")
+                class_pbar.set_postfix({"cls": cls_disp, "cache": kv_seq_len(past_kv)})
 
         elif args.input_mode == "mixed":
-            # Interleave images + labels in mini-batches
-            import random
             all_imgs: List[torch.Tensor] = []
             all_lbls: List[str] = []
             for cls_id in range(len(CIFAR10_CLASSES)):
@@ -2006,21 +2149,24 @@ def main():
 
             bs = args.batch_size
             is_first = (past_kv is None or kv_seq_len(past_kv) == 0)
-            for i in range(0, len(all_imgs_s), bs):
+            batch_indices = list(range(0, len(all_imgs_s), bs))
+            batch_pbar = tqdm(batch_indices, desc=f"Ep {epoch} Teaching (mixed)", leave=False, dynamic_ncols=True)
+            for step_idx, i in enumerate(batch_pbar):
                 b_imgs = list(all_imgs_s[i:i+bs])
                 b_lbls = list(all_lbls_s[i:i+bs])
                 prev_len = kv_seq_len(past_kv)
-                logging.info(f"  Mixed batch {i//bs + 1}: {len(b_imgs)} items, "
-                             f"cache={prev_len}")
+                if args.verbose:
+                    logging.info(f"  Mixed batch {i//bs + 1}: {len(b_imgs)} items, cache={prev_len}")
                 past_kv, info = teach_mixed(
                     llm, builder, img_tok, b_imgs, b_lbls, past_kv, compressor,
                     cfg=prompt_cfg, is_first_turn=(is_first and i == 0),
                     class_naming=class_naming,
                 )
-                logging.info(f"    -> cache after compress: {info['tokens_after_compress']}")
+                if args.verbose:
+                    logging.info(f"    -> cache after compress: {info['tokens_after_compress']}")
+                batch_pbar.set_postfix({"batch": f"{step_idx+1}/{len(batch_indices)}", "cache": kv_seq_len(past_kv)})
 
         elif args.input_mode == "guess-correct":
-            # Per-image guess + correction dialogue
             all_imgs  = []
             all_cls_ids = []
             for cls_id in range(len(CIFAR10_CLASSES)):
@@ -2030,7 +2176,8 @@ def main():
 
             correct_count = 0
             is_first = (past_kv is None or kv_seq_len(past_kv) == 0)
-            for i, (img, cls_id) in enumerate(zip(all_imgs, all_cls_ids)):
+            guess_pbar = tqdm(enumerate(zip(all_imgs, all_cls_ids)), total=len(all_imgs), desc=f"Ep {epoch} Guess-Correct", leave=False, dynamic_ncols=True)
+            for i, (img, cls_id) in guess_pbar:
                 cls_name = class_naming.name(cls_id)
                 past_kv, was_correct, predicted = teach_guess_correct(
                     llm, builder, img_tok, img, cls_name, class_naming,
@@ -2040,8 +2187,9 @@ def main():
                     guess_prob_random=args.guess_prob_random,
                 )
                 correct_count += int(was_correct)
-                if (i + 1) % 10 == 0 or i == 0:
-                    acc = correct_count / (i + 1) * 100
+                acc = correct_count / (i + 1) * 100
+                guess_pbar.set_postfix({"acc": f"{acc:.1f}%", "cache": kv_seq_len(past_kv)})
+                if args.verbose and ((i + 1) % 10 == 0 or i == 0):
                     true_disp = class_naming.display_name(cls_id)
                     pred_disp = class_naming.display_name(predicted)
                     logging.info(
@@ -2051,6 +2199,54 @@ def main():
                         f"(running acc={acc:.1f}%, cache={kv_seq_len(past_kv)})"
                     )
 
+        # Periodic evaluation (every eval_every epochs, plus final epoch)
+        is_last_epoch = (epoch == args.teaching_epochs)
+        should_eval = (epoch % args.eval_every == 0) or is_last_epoch
+
+        train_acc = None
+        val_acc = None
+
+        if should_eval:
+            cur_cache_len = kv_seq_len(past_kv)
+            logging.info(f"Evaluating at epoch {epoch} (cache: {cur_cache_len} tokens)...")
+
+            if n_train_eval_total > 0:
+                train_acc, _, _ = evaluate_dataset(
+                    llm, builder, img_tok, train_eval_by_class,
+                    class_naming=class_naming, past_kv=past_kv,
+                    cfg=prompt_cfg, answer_mode=args.answer_mode,
+                    verbose=args.verbose, desc=f"Ep {epoch} Eval (Train)",
+                )
+
+            if not args.skip_val and n_test_total > 0:
+                val_acc, last_val_true, last_val_pred = evaluate_dataset(
+                    llm, builder, img_tok, test_by_class,
+                    class_naming=class_naming, past_kv=past_kv,
+                    cfg=prompt_cfg, answer_mode=args.answer_mode,
+                    verbose=args.verbose, desc=f"Ep {epoch} Eval (Val)",
+                )
+
+            parts = [f"Epoch {epoch:2d}/{args.teaching_epochs}", f"KV Cache: {cur_cache_len} tokens"]
+            if train_acc is not None:
+                parts.append(f"Train Acc: {train_acc:.2f}%")
+            if val_acc is not None:
+                parts.append(f"Val Acc: {val_acc:.2f}%")
+            logging.info(" | ".join(parts))
+
+            history.append({
+                "epoch": epoch,
+                "kv_len": cur_cache_len,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+            })
+
+            post = {}
+            if train_acc is not None:
+                post["train"] = f"{train_acc:.1f}%"
+            if val_acc is not None:
+                post["val"] = f"{val_acc:.1f}%"
+            epoch_pbar.set_postfix(post)
+
     if past_kv is None or kv_seq_len(past_kv) == 0:
         logging.error("Teaching produced empty KV cache. Exiting.")
         return
@@ -2058,97 +2254,67 @@ def main():
     logging.info(f"\nTeaching complete. Final KV cache length: {kv_seq_len(past_kv)}")
 
     # -------------------------------------------------------------------
-    # Testing Phase
+    # Results & Summary Table
     # -------------------------------------------------------------------
     logging.info("\n" + "=" * 70)
-    logging.info("TESTING PHASE")
+    logging.info("TRAINING SUMMARY")
     logging.info("=" * 70)
-    logging.info(f"Answer mode: {args.answer_mode}")
 
-    all_true: List[str] = []
-    all_pred: List[str] = []
-    correct = 0
-    total   = 0
+    header = f"| {'Epoch':^7} | {'KV Len':^8} | {'Train Acc':^13} | {'Val Acc':^13} |"
+    sep = f"|{'-'*9}+{'-'*10}+{'-'*15}+{'-'*15}|"
+    logging.info(sep)
+    logging.info(header)
+    logging.info(sep)
+    for row in history:
+        tr_s = f"{row['train_acc']:.2f}%" if row['train_acc'] is not None else "N/A"
+        va_s = f"{row['val_acc']:.2f}%" if row['val_acc'] is not None else "N/A"
+        logging.info(f"| {row['epoch']:^7d} | {row['kv_len']:^8d} | {tr_s:^13s} | {va_s:^13s} |")
+    logging.info(sep)
 
-    for cls_id in range(len(CIFAR10_CLASSES)):
-        cls_name      = class_naming.name(cls_id)
-        images        = test_by_class[cls_id]
+    # Save to CSV
+    csv_file = log_dir / "metrics.csv"
+    try:
+        with open(csv_file, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["epoch", "kv_len", "train_acc", "val_acc"])
+            for row in history:
+                writer.writerow([
+                    row["epoch"],
+                    row["kv_len"],
+                    f"{row['train_acc']:.4f}" if row['train_acc'] is not None else "",
+                    f"{row['val_acc']:.4f}" if row['val_acc'] is not None else "",
+                ])
+        logging.info(f"Saved metrics CSV to: {csv_file}")
+    except Exception as e:
+        logging.warning(f"Failed to write metrics CSV: {e}")
 
-        for img_idx, img in enumerate(images):
+    # Per-class breakdown & Confusion Matrix (from final val run, if available)
+    if last_val_true and last_val_pred:
+        logging.info("\nPer-class accuracy (Final Val Pass):")
+        class_correct: Dict[str, int] = {}
+        class_total:   Dict[str, int] = {}
+        for t, p in zip(last_val_true, last_val_pred):
+            class_total[t]   = class_total.get(t, 0) + 1
+            class_correct[t] = class_correct.get(t, 0) + int(t == p)
+        for cls_id in range(len(class_naming.classes)):
+            name = class_naming.name(cls_id)
+            disp = class_naming.display_name(cls_id)
+            n = class_total.get(name, 0)
+            c = class_correct.get(name, 0)
+            bar = "█" * c + "░" * (n - c)
+            logging.info(f"  {disp:20s}: {c}/{n}  {bar}")
+
+        if not args.no_confusion and HAS_MATPLOTLIB:
             try:
-                pred_name, scores = classify_image(
-                    llm, builder, img_tok, img,
-                    class_naming=class_naming,
-                    past_kv=past_kv,
-                    cfg=prompt_cfg,
-                    answer_mode=args.answer_mode,
+                disp_true = [class_naming.display_name(t) for t in last_val_true]
+                disp_pred = [class_naming.display_name(p) for p in last_val_pred]
+                disp_classes = [class_naming.display_name(i) for i in range(len(class_naming.classes))]
+                plot_confusion_matrix(
+                    disp_true, disp_pred, disp_classes,
+                    log_dir / "confusion_matrix.png",
                 )
             except Exception as e:
-                logging.error(f"Error classifying {cls_name} img {img_idx}: {e}")
-                pred_name = class_naming.names[0]
-
-            is_ok = pred_name == cls_name
-            correct += int(is_ok)
-            total   += 1
-            all_true.append(cls_name)
-            all_pred.append(pred_name)
-
-            true_disp = class_naming.display_name(cls_id)
-            pred_disp = class_naming.display_name(pred_name)
-            logging.info(
-                f"  [{total:4d}] true={true_disp:20s} pred={pred_disp:20s} "
-                f"{'✓' if is_ok else '✗'}"
-            )
-            if args.log_level == "DEBUG":
-                top = sorted(scores.items(), key=lambda x: -x[1])[:5]
-                logging.debug(f"    top-5: {top}")
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-
-    # -------------------------------------------------------------------
-    # Results
-    # -------------------------------------------------------------------
-    accuracy = 100.0 * correct / total if total > 0 else 0.0
-    logging.info("\n" + "=" * 70)
-    logging.info("RESULTS")
-    logging.info("=" * 70)
-    logging.info(f"  Total:    {total}")
-    logging.info(f"  Correct:  {correct}")
-    logging.info(f"  Accuracy: {accuracy:.2f}%")
-    logging.info(f"  KV policy:   {compressor}")
-    logging.info(f"  Input mode:  {args.input_mode}")
-    logging.info(f"  Answer mode: {args.answer_mode}")
-    logging.info(f"  Image mode:  {args.img_mode}/{args.img_reduction}")
-
-    # Per-class breakdown
-    logging.info("\nPer-class accuracy:")
-    class_correct: Dict[str, int] = {}
-    class_total:   Dict[str, int] = {}
-    for t, p in zip(all_true, all_pred):
-        class_total[t]   = class_total.get(t, 0) + 1
-        class_correct[t] = class_correct.get(t, 0) + int(t == p)
-    for cls_id in range(len(class_naming.classes)):
-        name = class_naming.name(cls_id)
-        disp = class_naming.display_name(cls_id)
-        n = class_total.get(name, 0)
-        c = class_correct.get(name, 0)
-        bar = "█" * c + "░" * (n - c)
-        logging.info(f"  {disp:20s}: {c}/{n}  {bar}")
-
-    # Confusion matrix
-    if not args.no_confusion and HAS_MATPLOTLIB:
-        try:
-            disp_true = [class_naming.display_name(t) for t in all_true]
-            disp_pred = [class_naming.display_name(p) for p in all_pred]
-            disp_classes = [class_naming.display_name(i) for i in range(len(class_naming.classes))]
-            plot_confusion_matrix(
-                disp_true, disp_pred, disp_classes,
-                log_dir / "confusion_matrix.png",
-            )
-        except Exception as e:
-            logging.warning(f"Confusion matrix failed: {e}")
+                logging.warning(f"Confusion matrix failed: {e}")
 
 
 if __name__ == "__main__":
