@@ -29,15 +29,27 @@ Design pillars
 
 Usage
 -----
-    python exps/llm_learner.py
-    python exps/llm_learner.py --model-name Qwen/Qwen3-0.6B
-    python exps/llm_learner.py --img-mode byte_embeds --img-reduction sum
-    python exps/llm_learner.py --kv-policy streaming --kv-sink 4 --kv-last 64
-    python exps/llm_learner.py --kv-policy attn_query --kv-topk 128 \\
-        --attractor-range -10 -1 --neighbor-window 1 1
-    python exps/llm_learner.py --input-mode guess-correct --train-per-class 5
-    python exps/llm_learner.py --generic-class-names
-    python exps/llm_learner.py --config exps/configs/llm_learner_config.py
+# Qwen/Qwen3-0.6B
+# Qwen/Qwen3-1.7B
+# Qwen/Qwen3-4B
+# Qwen/Qwen3-8B
+# HuggingFaceTB/SmolLM-135M
+# HuggingFaceTB/SmolLM3-3B
+
+python exps/llm_learner.py --generic-class-names --model-name HuggingFaceTB/SmolLM3-3B \
+--img-mode byte_embeds --img-reduction sum --patch-size 8 \
+--kv-policy attn_query kv-topk 128 --neighbor-window 1 1 \
+--attractor-round assistant --attractor-temporary
+
+python exps/llm_learner.py --model-name Qwen/Qwen3-0.6B
+python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B
+python exps/llm_learner.py --img-mode byte_embeds --img-reduction sum
+python exps/llm_learner.py --kv-policy streaming --kv-sink 4 --kv-last 128
+python exps/llm_learner.py --kv-policy attn_query --kv-topk 128 \
+    --attractor-range -10 -1 --neighbor-window 1 1
+python exps/llm_learner.py --input-mode guess-correct --train-per-class 5
+python exps/llm_learner.py --generic-class-names
+python exps/llm_learner.py --config exps/configs/llm_learner_config.py
 """
 
 import argparse
@@ -738,12 +750,16 @@ class AttentionQueryCompressor(KVCacheCompressor):
         neighbor_window: Tuple[int, int] = (0, 0),
         agg: str = "mean",
         num_sink: int = 0,
+        attractor_round: str = "assistant",
+        attractor_temporary: bool = False,
     ):
-        self.top_k           = top_k
-        self.attractor_range = attractor_range
-        self.neighbor_window = neighbor_window
-        self.agg             = agg
-        self.num_sink        = num_sink
+        self.top_k               = top_k
+        self.attractor_range     = attractor_range
+        self.neighbor_window     = neighbor_window
+        self.agg                 = agg
+        self.num_sink            = num_sink
+        self.attractor_round     = attractor_round
+        self.attractor_temporary = attractor_temporary
 
     def _resolve_range(self, start: int, end: int, seq_len: int) -> Tuple[int, int]:
         """Resolve possibly-negative attractor range to positive [start, end) indices."""
@@ -770,7 +786,6 @@ class AttentionQueryCompressor(KVCacheCompressor):
         seq = kv_seq_len(past_kv)
 
         # -- Build scores: (seq_len,) mean attention from attractor to each position --
-        # attention_maps: tuple of (1, num_heads, seq_q, seq_k) per layer
         scores = self._score_positions(attention_maps, seq)
 
         # -- Attractor range: these positions are always kept --
@@ -817,6 +832,148 @@ class AttentionQueryCompressor(KVCacheCompressor):
 
         return kv_select(past_kv, keep)
 
+    def _score_from_query_attn(
+        self,
+        attn_maps: Tuple,
+        pre_len: int,
+        q_start: int,
+        q_end: int,
+    ) -> torch.Tensor:
+        """
+        Aggregate attention from the query rows [q_start, q_end) back to the pre_len keys.
+        """
+        layer_scores = []
+        for attn in attn_maps:
+            if attn is None:
+                continue
+            # attn: (1, num_heads, seq_q, seq_k)
+            # seq_q = query_len, seq_k = pre_len + query_len
+            if self.agg == "mean":
+                attn_avg = attn[0].mean(dim=0)        # (seq_q, seq_k)
+            else:
+                attn_avg = attn[0].max(dim=0).values  # (seq_q, seq_k)
+
+            q_start_c = max(0, min(q_start, attn_avg.shape[0]))
+            q_end_c = max(q_start_c, min(q_end, attn_avg.shape[0]))
+
+            if q_end_c > q_start_c:
+                query_rows = attn_avg[q_start_c:q_end_c, :pre_len]  # (Q, pre_len)
+                score = query_rows.mean(dim=0)                       # (pre_len,)
+            else:
+                score = attn_avg[:, :pre_len].mean(dim=0)
+            layer_scores.append(score)
+
+        if not layer_scores:
+            return torch.zeros(pre_len)
+
+        all_scores = torch.stack(layer_scores, dim=0)   # (num_layers, pre_len)
+        result = all_scores.mean(dim=0) if self.agg == "mean" else all_scores.max(dim=0).values
+        return result.float().cpu()
+
+    def compress_with_query(
+        self,
+        past_kv,
+        llm: "LLMWrapper",
+        builder: "EmbedBuilder",
+        class_naming: "ClassNaming",
+        data_range: Optional[Tuple[int, int]] = None,
+        cfg: "PromptConfig" = None,
+        in_turn_attentions: Optional[Tuple] = None,
+    ):
+        """
+        Run attractor query prefill (user query or assistant forced response),
+        score prior KV tokens, and prune according to policy.
+        """
+        seq = kv_seq_len(past_kv)
+        if seq == 0:
+            return past_kv
+
+        attractor_round = getattr(cfg, "attractor_round", self.attractor_round) if cfg else self.attractor_round
+        attractor_temporary = getattr(cfg, "attractor_temporary", self.attractor_temporary) if cfg else self.attractor_temporary
+
+        # Mode A: 'turn_tail' (legacy in-turn attention)
+        if attractor_round == "turn_tail":
+            return self.compress(past_kv, attention_maps=in_turn_attentions, data_range=data_range)
+
+        # Mode B: separate attractor query prefill ('user' or 'assistant')
+        class_names_list = ", ".join(class_naming.names) if class_naming else ""
+
+        if attractor_round == "user":
+            prompt_tmpl = getattr(cfg, "attractor_query_user_prompt", cfg.attractor_user_prompt) if cfg else "What class is this image, is it {class_names_list}?"
+            user_text = prompt_tmpl.format(class_names_list=class_names_list)
+            query_emb, positions = builder.build_query_turn(
+                user_text=user_text, visual_embeds=None, is_first_turn=False
+            )
+            q_start, q_end = positions.get("user_text", (0, query_emb.shape[1]))
+        elif attractor_round == "assistant":
+            user_prompt_tmpl = getattr(cfg, "attractor_user_prompt", "Now you need to consolidate now.") if cfg else "Now you need to consolidate now."
+            asst_prompt_tmpl = getattr(cfg, "attractor_asst_prompt", "Understood, I consolidate {class_names_list}.") if cfg else "Understood, I consolidate {class_names_list}."
+            user_text = user_prompt_tmpl.format(class_names_list=class_names_list)
+            asst_text = asst_prompt_tmpl.format(class_names_list=class_names_list)
+            query_emb, positions = builder.build_teaching_turn(
+                user_text=user_text, visual_embeds=None, assistant_text=asst_text, is_first_turn=False
+            )
+            q_start, q_end = positions.get("assistant", (0, query_emb.shape[1]))
+        else:
+            raise ValueError(f"Unknown attractor_round: {attractor_round}")
+
+        pre_len = seq
+        logits, query_kv, attn_maps = llm.prefill(
+            query_emb, past_kv=past_kv, use_cache=True, output_attentions=True
+        )
+        post_len = kv_seq_len(query_kv)
+
+        if attn_maps is None:
+            logging.warning("AttentionQueryCompressor: attention maps returned None (e.g. Flash Attention).")
+            if attractor_temporary:
+                return past_kv
+            return query_kv
+
+        scores = self._score_from_query_attn(
+            attn_maps=attn_maps,
+            pre_len=pre_len,
+            q_start=q_start,
+            q_end=q_end,
+        )
+
+        d_start, d_end = data_range if data_range is not None else (0, pre_len)
+        eligible = torch.zeros(pre_len, dtype=torch.bool)
+        eligible[d_start:d_end] = True
+        eligible[:self.num_sink] = False
+
+        eligible_scores = scores.clone()
+        eligible_scores[~eligible] = -float("inf")
+
+        actual_k = min(self.top_k, int(eligible.sum().item()))
+        if actual_k > 0:
+            topk_vals, topk_idx = torch.topk(eligible_scores, actual_k)
+            selected = topk_idx[topk_vals > -float("inf")]
+        else:
+            selected = torch.tensor([], dtype=torch.long)
+
+        # Expand with neighbor window
+        if self.neighbor_window != (0, 0):
+            before, after = self.neighbor_window
+            expanded = set(selected.tolist())
+            for pos in selected.tolist():
+                for nb in range(pos - before, pos + after + 1):
+                    if 0 <= nb < pre_len:
+                        expanded.add(nb)
+            selected = torch.tensor(sorted(expanded), dtype=torch.long)
+
+        always_keep = set(range(self.num_sink))
+        always_tensor = torch.tensor(sorted(always_keep), dtype=torch.long)
+
+        if attractor_temporary:
+            # Temporary prefill: query tokens are NOT kept!
+            keep = torch.unique(torch.cat([always_tensor, selected])).sort().values
+            return kv_select(past_kv, keep)
+        else:
+            # Appended prefill: keep selected pre-tokens + all query tokens
+            query_tokens = torch.arange(pre_len, post_len, dtype=torch.long)
+            keep = torch.unique(torch.cat([always_tensor, selected, query_tokens])).sort().values
+            return kv_select(query_kv, keep)
+
     def _score_positions(self, attention_maps: Tuple, seq: int) -> torch.Tensor:
         """
         Aggregate attention maps to a per-position score.
@@ -855,7 +1012,8 @@ class AttentionQueryCompressor(KVCacheCompressor):
 
     def __repr__(self):
         return (f"AttentionQueryCompressor(top_k={self.top_k}, "
-                f"attractor={self.attractor_range}, neighbor={self.neighbor_window})")
+                f"round={self.attractor_round}, temp={self.attractor_temporary}, "
+                f"neighbor={self.neighbor_window})")
 
 
 # ---------------------------------------------------------------------------
@@ -1045,6 +1203,13 @@ class PromptConfig:
     instruction_asst_prompt: str = "Understood."
     use_instruction_turn: bool = True
 
+    # Attractor query settings (for AttentionQueryCompressor)
+    attractor_round: str = "assistant"   # 'assistant' (user Q + forced asst A), 'user' (user Q only), or 'turn_tail'
+    attractor_temporary: bool = False    # If True, query prefill is transient/discarded; if False, appended to KV
+    attractor_user_prompt: str = "Now you need to consolidate now."
+    attractor_asst_prompt: str = "Understood, I consolidate {class_names_list}."
+    attractor_query_user_prompt: str = "What class is this image, is it {class_names_list}?"
+
     # Teaching (one-class mode)
     teach_user_tmpl: str  = "Here are examples of {class_name}."
     teach_asst_tmpl: str  = "Understood. I have memorized {class_name}."
@@ -1074,6 +1239,43 @@ DEFAULT_PROMPT_CFG = PromptConfig()
 # ---------------------------------------------------------------------------
 # 9. Teaching Functions
 # ---------------------------------------------------------------------------
+
+def compress_kv(
+    past_kv,
+    compressor: KVCacheCompressor,
+    llm: LLMWrapper,
+    builder: EmbedBuilder,
+    class_naming: Optional[ClassNaming] = None,
+    data_range: Optional[Tuple[int, int]] = None,
+    cfg: PromptConfig = DEFAULT_PROMPT_CFG,
+    in_turn_attentions: Optional[Tuple] = None,
+):
+    """
+    Unified entry point for KV compression.
+    Handles Noop, StreamingLLM, and AttentionQuery (both in-turn and external query probe).
+    """
+    if past_kv is None or compressor is None:
+        return past_kv
+
+    if isinstance(compressor, NoopCompressor):
+        return past_kv
+
+    if isinstance(compressor, StreamingLLMCompressor):
+        return compressor.compress(past_kv, data_range=data_range)
+
+    if isinstance(compressor, AttentionQueryCompressor):
+        return compressor.compress_with_query(
+            past_kv=past_kv,
+            llm=llm,
+            builder=builder,
+            class_naming=class_naming,
+            data_range=data_range,
+            cfg=cfg,
+            in_turn_attentions=in_turn_attentions,
+        )
+
+    return compressor.compress(past_kv, data_range=data_range)
+
 
 @torch.no_grad()
 def prefill_instruction(
@@ -1111,6 +1313,7 @@ def teach_one_class(
     compressor: KVCacheCompressor,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     is_first_turn: bool = False,
+    class_naming: Optional[ClassNaming] = None,
 ) -> Tuple[object, Dict]:
     """
     'one-class' input mode: present all images of one class together.
@@ -1149,7 +1352,9 @@ def teach_one_class(
     )
 
     prev_len = kv_seq_len(past_kv)
-    need_attn = isinstance(compressor, AttentionQueryCompressor)
+    need_attn = isinstance(compressor, AttentionQueryCompressor) and (
+        getattr(cfg, "attractor_round", "assistant") == "turn_tail"
+    )
     logits, past_kv, attn_maps = llm.prefill(
         turn_emb, past_kv=past_kv, use_cache=True, output_attentions=need_attn
     )
@@ -1161,7 +1366,10 @@ def teach_one_class(
         abs_vis = (prev_len + vs, prev_len + ve)
 
     full_len = kv_seq_len(past_kv)
-    past_kv = compressor.compress(past_kv, attention_maps=attn_maps, data_range=abs_vis)
+    past_kv = compress_kv(
+        past_kv, compressor, llm, builder, class_naming,
+        data_range=abs_vis, cfg=cfg, in_turn_attentions=attn_maps
+    )
     post_len = kv_seq_len(past_kv)
 
     return past_kv, {
@@ -1182,6 +1390,7 @@ def teach_mixed(
     compressor: KVCacheCompressor,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     is_first_turn: bool = False,
+    class_naming: Optional[ClassNaming] = None,
 ) -> Tuple[object, Dict]:
     """
     'mixed' input mode: interleave visual embeds and class labels in one turn.
@@ -1225,13 +1434,18 @@ def teach_mixed(
     turn_emb = torch.cat(parts, dim=1)
     prev_len = kv_seq_len(past_kv)
 
-    need_attn = isinstance(compressor, AttentionQueryCompressor)
+    need_attn = isinstance(compressor, AttentionQueryCompressor) and (
+        getattr(cfg, "attractor_round", "assistant") == "turn_tail"
+    )
     logits, past_kv, attn_maps = llm.prefill(
         turn_emb, past_kv=past_kv, use_cache=True, output_attentions=need_attn
     )
 
     abs_vis = (prev_len + vis_start, prev_len + vis_end)
-    past_kv = compressor.compress(past_kv, attention_maps=attn_maps, data_range=abs_vis)
+    past_kv = compress_kv(
+        past_kv, compressor, llm, builder, class_naming,
+        data_range=abs_vis, cfg=cfg, in_turn_attentions=attn_maps
+    )
     post_len = kv_seq_len(past_kv)
 
     return past_kv, {
@@ -1250,6 +1464,7 @@ def teach_guess_correct(
     true_class_name: str,
     class_naming: ClassNaming,
     past_kv,
+    compressor: Optional[KVCacheCompressor] = None,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     is_first_turn: bool = False,
     guess_prob_gt: float = 0.0,
@@ -1315,6 +1530,12 @@ def teach_guess_correct(
         is_first_turn=False,
     )
     _, past_kv_q, _ = llm.prefill(fb_emb, past_kv=past_kv_q, use_cache=True)
+
+    if compressor is not None and not isinstance(compressor, NoopCompressor):
+        past_kv_q = compress_kv(
+            past_kv_q, compressor, llm, builder, class_naming,
+            data_range=None, cfg=cfg, in_turn_attentions=None
+        )
 
     return past_kv_q, was_correct, guessed_name
 
@@ -1480,13 +1701,6 @@ def plot_confusion_matrix(
 def parse_args():
     p = argparse.ArgumentParser(description="LLM Learner")
 
-    # Model
-    # Qwen/Qwen3-0.6B
-    # Qwen/Qwen3-1.7B
-    # Qwen/Qwen3-4B
-    # Qwen/Qwen3-8B
-    # HuggingFaceTB/SmolLM-135M
-    # HuggingFaceTB/SmolLM3-3B
     p.add_argument("--model-name", default="HuggingFaceTB/SmolLM3-3B",
                    help="HuggingFace model name")
     p.add_argument("--device", default=None,
@@ -1504,7 +1718,6 @@ def parse_args():
     p.add_argument("--img-reduction", choices=["random_proj", "sum", "avg"],
                    default="random_proj",
                    help="Patch reduction method")
-
     # KV cache compression
     p.add_argument("--kv-policy", choices=["noop", "streaming", "attn_query"],
                    default="attn_query")
@@ -1520,6 +1733,15 @@ def parse_args():
     p.add_argument("--neighbor-window", type=int, nargs=2, default=[0, 0],
                    metavar=("BEFORE", "AFTER"),
                    help="AttentionQuery: neighbor window around selected positions")
+    p.add_argument("--attractor-round", choices=["assistant", "user", "turn_tail"],
+                   default="assistant",
+                   help="Attractor query type: 'assistant'=user Q + forced asst A, 'user'=user Q only, 'turn_tail'=use in-turn tail tokens")
+    p.add_argument("--attractor-temporary", action="store_true", default=False,
+                   help="If set, attractor query prefill is temporary/transient (not appended to KV cache)")
+    p.add_argument("--attractor-user-prompt", type=str, default=None,
+                   help="Override user prompt for attractor query")
+    p.add_argument("--attractor-asst-prompt", type=str, default=None,
+                   help="Override assistant prompt for attractor query")
 
     # Input / teaching mode
     p.add_argument("--input-mode",
@@ -1708,6 +1930,8 @@ def main():
             top_k=args.kv_topk,
             attractor_range=tuple(args.attractor_range),
             neighbor_window=tuple(args.neighbor_window),
+            attractor_round=args.attractor_round,
+            attractor_temporary=args.attractor_temporary,
         )
     logging.info(f"KV compressor: {compressor}")
 
@@ -1722,6 +1946,13 @@ def main():
     prompt_cfg = DEFAULT_PROMPT_CFG
     if args.disable_instruction:
         prompt_cfg.use_instruction_turn = False
+    prompt_cfg.attractor_round = args.attractor_round
+    prompt_cfg.attractor_temporary = args.attractor_temporary
+    if args.attractor_user_prompt is not None:
+        prompt_cfg.attractor_user_prompt = args.attractor_user_prompt
+        prompt_cfg.attractor_query_user_prompt = args.attractor_user_prompt
+    if args.attractor_asst_prompt is not None:
+        prompt_cfg.attractor_asst_prompt = args.attractor_asst_prompt
 
     if prompt_cfg.use_instruction_turn and prompt_cfg.instruction_user_prompt:
         logging.info("Prefilling first-round instruction prompt...")
@@ -1754,6 +1985,7 @@ def main():
                     compressor=compressor,
                     cfg=prompt_cfg,
                     is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
+                    class_naming=class_naming,
                 )
                 logging.info(f"    -> +{info['tokens_added']} tokens, "
                              f"cache after compress: {info['tokens_after_compress']}")
@@ -1783,6 +2015,7 @@ def main():
                 past_kv, info = teach_mixed(
                     llm, builder, img_tok, b_imgs, b_lbls, past_kv, compressor,
                     cfg=prompt_cfg, is_first_turn=(is_first and i == 0),
+                    class_naming=class_naming,
                 )
                 logging.info(f"    -> cache after compress: {info['tokens_after_compress']}")
 
@@ -1801,7 +2034,7 @@ def main():
                 cls_name = class_naming.name(cls_id)
                 past_kv, was_correct, predicted = teach_guess_correct(
                     llm, builder, img_tok, img, cls_name, class_naming,
-                    past_kv, cfg=prompt_cfg,
+                    past_kv, compressor=compressor, cfg=prompt_cfg,
                     is_first_turn=(is_first and i == 0),
                     guess_prob_gt=args.guess_prob_gt,
                     guess_prob_random=args.guess_prob_random,
