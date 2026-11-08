@@ -565,6 +565,7 @@ class LLMWrapper:
                 self.special_tokens[name] = token_id[0]
         logging.info(f"Special tokens: {self.special_tokens}")
     
+    @torch.no_grad()
     def embed_text(self, text: str) -> torch.Tensor:
         """
         Tokenize text and convert to embeddings.
@@ -582,7 +583,8 @@ class LLMWrapper:
         input_ids = input_ids.to(device)
         embeds = embed_layer(input_ids)
         return embeds
-    
+
+    @torch.no_grad()
     def prefill(self, inputs_embeds: torch.Tensor, 
                 use_cache: bool = True,
                 past_key_values: Optional[tuple] = None) -> Tuple[torch.Tensor, Optional[tuple]]:
@@ -610,6 +612,7 @@ class LLMWrapper:
         )
         return outputs.logits, outputs.past_key_values if use_cache else None
     
+    @torch.no_grad()
     def decode(self, inputs_embeds: torch.Tensor, past_key_values: Optional[tuple] = None,
                max_new_tokens: int = 20, do_sample: bool = True, 
                top_p: float = 0.9) -> Tuple[torch.Tensor, Optional[tuple]]:
@@ -641,6 +644,7 @@ class LLMWrapper:
         
         raise NotImplementedError("Decode with inputs_embeds not yet implemented. Use generate_ar() instead.")
     
+    @torch.no_grad()
     def generate_ar(self, inputs_embeds: torch.Tensor, past_key_values: Optional[tuple] = None,
                     max_new_tokens: int = 20, do_sample: bool = True, 
                     top_p: float = 0.9) -> torch.Tensor:
@@ -681,6 +685,7 @@ class LLMWrapper:
         
         return outputs
     
+    @torch.no_grad()
     def get_next_token_logits(self, inputs_embeds: torch.Tensor, 
                                past_key_values: Optional[tuple] = None) -> torch.Tensor:
         """
@@ -703,6 +708,7 @@ class LLMWrapper:
         next_token_logits = outputs.logits[:, -1, :]
         return next_token_logits
     
+    @torch.no_grad()
     def get_sequence_prob(self, context_embeds: torch.Tensor, 
                           target_text: str, past_key_values: Optional[tuple] = None) -> float:
         """
@@ -752,7 +758,7 @@ class LLMWrapper:
             token_logits = outputs.logits[0, 0, :]  # Shape: (vocab_size,)
             token_id = target_ids[0, i].item()
             prob = torch.softmax(token_logits, dim=-1)[token_id]
-            log_prob += torch.log(prob + 1e-10)
+            log_prob += torch.log(prob + 1e-10).item()
             current_pkv = outputs.past_key_values
         
         return log_prob.item()
@@ -762,6 +768,7 @@ class LLMWrapper:
 # KV Cache Manager
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
 def remove_kv_range(past_key_values, start: int, end: int):
     """
     Remove KV cache entries for positions [start:end].
@@ -1358,6 +1365,13 @@ def classify_image(llm: LLMWrapper, patchifier: Patchifier, test_image: torch.Te
     # Get logits for next token
     next_token_logits, _ = llm.prefill(test_embeds, use_cache=False, 
                                         past_key_values=past_kv)
+    # next_token_logits, _ = llm.prefill(test_embeds, use_cache=True, 
+    # # if torch.cuda.is_available():
+    #     torch.cuda.empty_cache()
+    #     torch.cuda.synchronize()
+    # del _
+    # gc.collect()
+
     next_token_logits = next_token_logits[:, -1, :]  # (1, vocab_size)
     # del test_image
     # if torch.cuda.is_available():
