@@ -23,13 +23,13 @@ python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
 --generic-class-names
 
 python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
+--attn-impl eager \
 --img-mode floats --img-reduction random_proj --patch-size 16 \
---kv-policy streaming --kv-sink 512 --kv-topk 2048 --neighbor-window 1 1 \
+--kv-policy streaming --kv-sink 4 --kv-topk 128 --neighbor-window 0 0 \
 --attractor-round turn_tail --attractor-temporary \
---train-per-class 100 --test-per-class 10 \
+--train-per-class 10 --test-per-class 10 \
 --teaching-epochs 2 --batch-size 10 \
 --eval-every 1 --train-eval-per-class 10 \
 --answer-mode first_token \
---eval-every 1 --train-eval-per-class 10 \
 --input-mode mixed \
---generic-class-names
+--verbose --generic-class-names

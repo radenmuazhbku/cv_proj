@@ -465,7 +465,7 @@ class LLMWrapper:
             load_kwargs["attn_implementation"] = attn_implementation
         if torch_dtype is not None:
             load_kwargs["torch_dtype"] = torch_dtype
-        load_kwargs["attn_implementation"] = "eager"
+        # load_kwargs["attn_implementation"] = "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name, **load_kwargs
         ).to(self.device)
@@ -1730,9 +1730,9 @@ def evaluate_dataset(
                     top = sorted(scores.items(), key=lambda x: -x[1])[:5]
                     logging.debug(f"    top-5: {top}")
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
     pbar.close()
     accuracy = 100.0 * correct / total_imgs if total_imgs > 0 else 0.0
