@@ -25,7 +25,7 @@ python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
 python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
 --attn-impl eager \
 --img-mode floats --img-reduction random_proj --patch-size 16 \
---kv-policy streaming --kv-sink 4 --kv-topk 128 --neighbor-window 0 0 \
+--kv-policy streaming --kv-sink 4 --kv-topk 512 --neighbor-window 0 0 \
 --attractor-round turn_tail --attractor-temporary \
 --train-per-class 10 --test-per-class 10 \
 --teaching-epochs 2 --batch-size 10 \
@@ -33,3 +33,25 @@ python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
 --answer-mode first_token \
 --input-mode mixed \
 --verbose --generic-class-names
+
+python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
+--attn-impl sdpa --img-mode byte_embeds --img-reduction sum \
+--patch-size 4 --kv-policy streaming --kv-sink 512 --kv-topk 1024 --neighbor-window 0 0 - \
+--attractor-round turn_tail \
+--train-per-class 200 --test-per-class 200 --teaching-epochs 10 --batch-size 50 \
+--eval-every 1 --answer-mode first_token --input-mode mixed
+
+python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
+--attn-impl sdpa --img-mode byte_embeds --img-reduction sum \
+--patch-size 4 --kv-policy streaming --kv-sink 512 --kv-topk 1024 --neighbor-window 0 0 - \
+--attractor-round turn_tail \
+--train-per-class 200 --test-per-class 200 --teaching-epochs 10 --batch-size 50 \
+--eval-every 1 --answer-mode first_token --input-mode mixed
+
+python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B \
+--attn-impl sdpa --img-mode byte_embeds --img-reduction sum \
+--patch-size 16 --kv-policy streaming --kv-sink 512 --kv-topk 2048 --neighbor-window 0 0 \
+--train-per-class 200 --test-per-class 200 --teaching-epochs 10 --batch-size 50 \
+--eval-every 1 --answer-mode first_token \
+--input-mode guess-correct \
+--guess-prob-gt 0.1 --guess-prob-random 0.1

@@ -22,50 +22,42 @@ Design pillars
    - Noop: identity, keep everything
    - StreamingLLM: retain fixed sink positions + last K tokens
    - AttentionQuery: retain top-K tokens by attention score from "attractor" query positions
-5. Teaching input modes:
-   - 'one-class': one batch per class ("class1 <e1> <e2> ...")
-   - 'mixed': interleaved classes ("<e1> class1 <e2> class2 ...")
-   - 'guess-correct': model guesses; feedback given per example
+5. Teaching: the model predicts one image at a time and receives feedback.
+    Subsets default to 100 images per class; training shuffles with seed 0.
+    Set --seed None for ordered training; integer and fractional subsets work.
 
 Usage
 -----
-# Qwen/Qwen3-0.6B
-# Qwen/Qwen3-1.7B
-# Qwen/Qwen3-4B
-# Qwen/Qwen3-8B
-# HuggingFaceTB/SmolLM-135M
-# HuggingFaceTB/SmolLM3-3B
+Qwen/Qwen3-0.6B
+Qwen/Qwen3-1.7B
+Qwen/Qwen3-4B
+Qwen/Qwen3-8B
+HuggingFaceTB/SmolLM-135M
+HuggingFaceTB/SmolLM3-3B
 
 python exps/llm_learner.py --generic-class-names --model-name HuggingFaceTB/SmolLM3-3B \
 --img-mode byte_embeds --img-reduction sum --patch-size 16 \
 --kv-policy attn_query --kv-sink 512 --kv-topk 2048 --neighbor-window 1 1 \
 --attractor-round turn_tail --attractor-temporary \
---train-per-class 100 --test-per-class 10 \
---teaching-epochs 2 --batch-size 10 \
---eval-every 1 --train-eval-per-class 10 \
---answer-mode first_token \
---eval-every 1 --train-eval-per-class 10 \
---input-mode mixed
-
---input-mode guess-correct \
---guess-prob-gt 0.5 --guess-prob-random 0.5 \
-
-python exps/llm_learner.py --model-name Qwen/Qwen3-0.6B
-python exps/llm_learner.py --model-name HuggingFaceTB/SmolLM3-3B
+--teaching-epochs 2 \
+--eval-every 1 --train-eval-samples 100 --answer-mode full_prob --temperature 0.0 --guess-prob-gt 0.0 --guess-prob-random 0.0
 python exps/llm_learner.py --img-mode byte_embeds --img-reduction sum
 python exps/llm_learner.py --kv-policy streaming --kv-sink 4 --kv-last 128
 python exps/llm_learner.py --kv-policy attn_query --kv-topk 128 \
     --attractor-range -10 -1 --neighbor-window 1 1
-python exps/llm_learner.py --input-mode guess-correct --train-per-class 5
+python exps/llm_learner.py --train-samples 5
+python exps/llm_learner.py --train-samples 0.1 --test-samples 0.1 --seed None
 python exps/llm_learner.py --generic-class-names
 python exps/llm_learner.py --config exps/configs/llm_learner_config.py
 """
 
 import argparse
 import ast
+import copy
 import csv
 import gc
 import logging
+import math
 import random
 import sys
 from abc import ABC, abstractmethod
@@ -485,7 +477,7 @@ class LLMWrapper:
         return self.model.get_input_embeddings().weight.detach()
 
     @torch.no_grad()
-    def embed_text(self, text: str) -> torch.Tensor:
+    def embed_text(self, text: str, add_special_tokens: bool = True) -> torch.Tensor:
         """
         Tokenize text and embed it.
 
@@ -496,7 +488,11 @@ class LLMWrapper:
         if not text:
             return torch.zeros(1, 0, self.hidden_dim,
                                device=self.device, dtype=self.model_dtype)
-        ids = self.tokenizer(text, return_tensors="pt").input_ids.to(self.device)
+        ids = self.tokenizer(
+            text,
+            return_tensors="pt",
+            add_special_tokens=add_special_tokens,
+        ).input_ids.to(self.device)
         emb = self.model.get_input_embeddings()(ids)  # (1, T, D)
         return emb
 
@@ -911,6 +907,12 @@ class AttentionQueryCompressor(KVCacheCompressor):
         if attractor_round == "user":
             prompt_tmpl = getattr(cfg, "attractor_query_user_prompt", cfg.attractor_user_prompt) if cfg else "What class is this image, is it {class_names_list}?"
             user_text = prompt_tmpl.format(class_names_list=class_names_list)
+            if cfg and cfg.verbose:
+                _log_prompt_exchange(
+                    "KV compression attractor",
+                    user_text,
+                    "<no assistant turn; user query only>",
+                )
             query_emb, positions = builder.build_query_turn(
                 user_text=user_text, visual_embeds=None, is_first_turn=False
             )
@@ -920,6 +922,12 @@ class AttentionQueryCompressor(KVCacheCompressor):
             asst_prompt_tmpl = getattr(cfg, "attractor_asst_prompt", "Understood, I consolidate {class_names_list}.") if cfg else "Understood, I consolidate {class_names_list}."
             user_text = user_prompt_tmpl.format(class_names_list=class_names_list)
             asst_text = asst_prompt_tmpl.format(class_names_list=class_names_list)
+            if cfg and cfg.verbose:
+                _log_prompt_exchange(
+                    "KV compression attractor",
+                    user_text,
+                    asst_text,
+                )
             query_emb, positions = builder.build_teaching_turn(
                 user_text=user_text, visual_embeds=None, assistant_text=asst_text, is_first_turn=False
             )
@@ -1032,7 +1040,7 @@ class AttentionQueryCompressor(KVCacheCompressor):
 
 class EmbedBuilder:
     """
-    Build mixed text + visual embedding sequences using extracted chat tags.
+    Build text + visual embedding sequences using extracted chat tags.
 
     All returned tensors are on the LLM's device with the LLM's dtype.
     Shape convention: (1, T, hidden_dim) -- single batch dimension.
@@ -1152,11 +1160,31 @@ class ClassNaming:
         Useful to reduce implicit LLM bias toward known categories.
     """
 
-    def __init__(self, classes: List[str], use_generic: bool = False):
+    def __init__(
+        self,
+        classes: List[str],
+        use_generic: bool = False,
+        label_mode: str = "direct",
+    ):
+        aliases = {"mc_letters": "letters", "mc_digits": "digits"}
+        label_mode = aliases.get(label_mode, label_mode)
+        if use_generic:
+            label_mode = "generic"
+        if label_mode not in ("direct", "letters", "digits", "generic"):
+            raise ValueError(f"Unknown class label mode: {label_mode}")
+        if label_mode == "letters" and len(classes) > 26:
+            raise ValueError("Letter labels support at most 26 classes")
+
         self.classes      = classes
-        self.use_generic  = use_generic
+        self.label_mode   = label_mode
+        self.use_generic  = label_mode == "generic"
         self._id_to_name  = {
-            i: (f"class{i+1}" if use_generic else cls)
+            i: (
+                cls if label_mode == "direct" else
+                chr(ord("A") + i) if label_mode == "letters" else
+                str(i + 1) if label_mode == "digits" else
+                f"class{i+1}"
+            )
             for i, cls in enumerate(classes)
         }
         self._name_to_id = {v: k for k, v in self._id_to_name.items()}
@@ -1171,7 +1199,7 @@ class ClassNaming:
         return self._name_to_id[name]
 
     def display_name(self, name_or_id: Union[str, int]) -> str:
-        """Return display name; in generic mode, also prints the original class name if known."""
+        """Return the label and, for encoded modes, its original class name."""
         if isinstance(name_or_id, int):
             cid = name_or_id
             cname = self.name(cid)
@@ -1179,13 +1207,189 @@ class ClassNaming:
             cname = name_or_id
             cid = self._name_to_id.get(cname, None)
 
-        if self.use_generic and cid is not None and 0 <= cid < len(self.classes):
+        if self.label_mode != "direct" and cid is not None and 0 <= cid < len(self.classes):
             return f"{cname} ({self.classes[cid]})"
         return cname
 
     @property
     def names(self) -> List[str]:
         return [self._id_to_name[i] for i in range(len(self.classes))]
+
+
+def _format_class_prompt(
+    template: str,
+    class_naming: ClassNaming,
+    class_name: Optional[str] = None,
+    include_options: bool = False,
+) -> str:
+    """Format a prompt with optional label-to-class choices."""
+    if include_options:
+        if class_naming.label_mode == "direct":
+            class_names_list = ", ".join(class_naming.names)
+        else:
+            class_names_list = ", ".join(
+                f"{name}: {class_naming.original(i)}"
+                for i, name in enumerate(class_naming.names)
+            )
+    else:
+        class_names_list = ", ".join(class_naming.names)
+    if include_options:
+        if "{class_names_list}" not in template:
+            template = f"{template} Options: {{class_names_list}}."
+        if "answer with" not in template.lower():
+            template = f"{template} Answer with exactly one listed label."
+    return template.format(
+        class_name=class_name or "",
+        class_names_list=class_names_list,
+    )
+
+
+def _render_embedded_images(
+    user_text: str,
+    patch_count: int,
+) -> str:
+    """Render an image's continuous patch embedding sequence readably."""
+    if patch_count <= 0:
+        return user_text or "<empty>"
+    image_marker = f"<image embeddings: {patch_count} patch vectors>"
+    return f"{user_text}\n    {image_marker}" if user_text else image_marker
+
+
+def _log_prompt_exchange(
+    context: str,
+    user_prompt: str,
+    assistant_prompt: str,
+) -> None:
+    """Log the human-readable user/assistant content used for one exchange."""
+    logging.info(
+        "Prompt (%s):\n  User: %s\n  Assistant: %s",
+        context,
+        user_prompt or "<empty>",
+        assistant_prompt or "<empty>",
+    )
+
+
+def _log_query_and_extraction(
+    context: str,
+    query_text: str,
+    patch_count: int,
+    chat: ChatSegments,
+    answer_mode: str,
+    temperature: float,
+    scores: Dict[str, float],
+    selected: str,
+) -> None:
+    """Log the exact image query and how its assistant answer was extracted."""
+    logging.info("Runtime image-query trace (%s):", context)
+    logging.info("  User content:\n%s", _render_embedded_images(query_text, patch_count))
+    logging.info("  Chat boundary before answer: user_close=%r assistant_open=%r",
+                 chat.user_close, chat.asst_open or chat.user_to_asst)
+    logging.info(
+        "  Answer extraction: mode=%s, temperature=%s, candidates=%s",
+        answer_mode,
+        temperature,
+        ", ".join(scores),
+    )
+    score_kind = "sequence log-probability" if answer_mode == "full_prob" else "first-token logit"
+    logging.info("  Candidate %s scores:", score_kind)
+    for label, score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+        logging.info("    %-20s %.8g", label, score)
+    logging.info("  Selected assistant answer: %s", selected)
+
+
+def _log_prompt_catalog(
+    cfg: "PromptConfig",
+    class_naming: ClassNaming,
+    chat: ChatSegments,
+    answer_mode: str,
+    temperature: float,
+    attractor_round: str,
+) -> None:
+    """Log all configured prompt templates and representative rendered turns."""
+    if not cfg.verbose:
+        return
+
+    query = _format_class_prompt(
+        cfg.guess_user_tmpl,
+        class_naming,
+        include_options=(cfg.include_class_options or answer_mode == "full_prob"),
+    )
+    sample_label = class_naming.names[0]
+    correct_text = cfg.guess_correct_asst.format(class_name=sample_label)
+    wrong_text = cfg.guess_wrong_asst.format(class_name=sample_label)
+    class_names_list = ", ".join(class_naming.names)
+    attractor_query = cfg.attractor_query_user_prompt.format(
+        class_names_list=class_names_list
+    )
+    attractor_user = cfg.attractor_user_prompt.format(
+        class_names_list=class_names_list
+    )
+    attractor_asst = cfg.attractor_asst_prompt.format(
+        class_names_list=class_names_list
+    )
+
+    logging.info("=" * 78)
+    logging.info("VERBOSE PROMPT CATALOG — templates and representative rendered turns")
+    logging.info("=" * 78)
+    logging.info("Class labels: %s", ", ".join(class_naming.names))
+    logging.info("Image insertion format: user text, then one image embedding sequence")
+    logging.info("  %s", _render_embedded_images(query, patch_count=4))
+    logging.info("Answer extraction: mode=%s, temperature=%s", answer_mode, temperature)
+    logging.info("  Candidate labels: %s", ", ".join(class_naming.names))
+    logging.info("  At temperature 0, select the maximum candidate score; otherwise sample from candidate scores.")
+    logging.info("Chat-template boundaries used by the embed builder:")
+    logging.info("  global prefix: %r", chat.global_prefix)
+    logging.info("  user close:    %r", chat.user_close)
+    logging.info("  assistant open:%r", chat.asst_open)
+    logging.info("  user->assistant fallback: %r", chat.user_to_asst)
+    logging.info("  assistant tail:%r", chat.asst_tail)
+    logging.info("  next-turn separator: %r", chat.turn_separator)
+
+    _log_prompt_exchange(
+        "configured instruction turn",
+        cfg.instruction_user_prompt,
+        cfg.instruction_asst_prompt,
+    )
+    _log_prompt_exchange(
+        "configured image query template (used in teaching and test)",
+        _render_embedded_images(query, patch_count=4),
+        "<sampled from candidate labels: " + ", ".join(class_naming.names) + ">",
+    )
+    _log_prompt_exchange(
+        "configured feedback when sampled answer is correct",
+        cfg.guess_correct_user.format(class_name=sample_label),
+        correct_text,
+    )
+    _log_prompt_exchange(
+        "configured feedback when sampled answer is wrong",
+        cfg.guess_correct_user.format(class_name=sample_label),
+        wrong_text,
+    )
+    _log_prompt_exchange(
+        "configured attractor query prompt (user round)",
+        attractor_query,
+        "<no assistant turn; user query only>",
+    )
+    _log_prompt_exchange(
+        "configured attractor prompt (assistant round)",
+        attractor_user,
+        attractor_asst,
+    )
+    logging.info("Active KV attractor mode: %s", attractor_round)
+    logging.info("Raw template formats:")
+    for template_name, template_value in (
+        ("instruction_user_prompt", cfg.instruction_user_prompt),
+        ("instruction_asst_prompt", cfg.instruction_asst_prompt),
+        ("guess_user_tmpl", cfg.guess_user_tmpl),
+        ("guess_correct_user", cfg.guess_correct_user),
+        ("guess_correct_asst", cfg.guess_correct_asst),
+        ("guess_wrong_asst", cfg.guess_wrong_asst),
+        ("attractor_query_user_prompt", cfg.attractor_query_user_prompt),
+        ("attractor_user_prompt", cfg.attractor_user_prompt),
+        ("attractor_asst_prompt", cfg.attractor_asst_prompt),
+    ):
+        logging.info("  %s = %r", template_name, template_value)
+    logging.info("=" * 78)
 
 
 # ---------------------------------------------------------------------------
@@ -1206,8 +1410,8 @@ class PromptConfig:
         "SGD classification training, assisted by a KV cache compression algorithm.\n"
         "Because earlier KV cache entries are dynamically removed, your self-attention at recent "
         "timesteps may not attend back to all earlier inputs.\n\n"
-        "In each turn, you will be given a batch of image patch vectors and label pairs. "
-        "Respond in a way that consolidates memory.\n\n"
+        "You will see one image's patch vectors at a time and predict its class. "
+        "The user will then reveal the correct class. Learn from that feedback.\n\n"
         "At the end of training, there will be test images unseen during in-context learning."
     )
     instruction_asst_prompt: str = "Understood."
@@ -1220,26 +1424,14 @@ class PromptConfig:
     attractor_asst_prompt: str = "Understood, I consolidate {class_names_list}."
     attractor_query_user_prompt: str = "What class is this image, is it {class_names_list}?"
 
-    # Teaching (one-class mode)
-    teach_user_tmpl: str  = "Here are examples of {class_name}."
-    teach_asst_tmpl: str  = "Understood. I have memorized {class_name}."
-
-    # Teaching (mixed mode)
-    mixed_intro_tmpl: str = "Match each visual to its class."
-    mixed_label_sep: str  = " "    # text placed between embed and next-label
-    mixed_asst_tmpl: str  = "I have memorized all examples."
-
-    # Guess-correct mode
-    guess_user_tmpl: str      = ""    # user turn is just the visual embed
+    # Per-image teaching and test query
+    guess_user_tmpl: str      = "What class is this image?"
     guess_correct_user: str   = "{class_name}"
-    guess_correct_asst: str   = "correct, {class_name}"
-    guess_wrong_asst: str     = "wrong, it is {class_name}"
+    guess_correct_asst: str   = "I was correct, it is {class_name}"
+    guess_wrong_asst: str     = "I was wrong, should be {class_name}"
 
-    # Test / classification query
-    test_user_tmpl: str = "What class is this image?"
-
-    # Sep between images in a batch
-    image_sep: str = " "
+    include_class_options: bool = False
+    verbose: bool = False
 
 
 # Default config
@@ -1298,6 +1490,12 @@ def prefill_instruction(
     Prefill the first-round instruction turn (user instruction + assistant response).
     This establishes task context before any image training data is ingested.
     """
+    if cfg.verbose:
+        _log_prompt_exchange(
+            "instruction",
+            cfg.instruction_user_prompt,
+            cfg.instruction_asst_prompt,
+        )
     turn_emb, positions = builder.build_teaching_turn(
         user_text=cfg.instruction_user_prompt,
         visual_embeds=None,
@@ -1313,161 +1511,6 @@ def prefill_instruction(
 
 
 @torch.no_grad()
-def teach_one_class(
-    llm: LLMWrapper,
-    builder: EmbedBuilder,
-    img_tok: ImageTokenizer,
-    class_name: str,
-    images: torch.Tensor,          # (N, C, H, W)
-    past_kv,
-    compressor: KVCacheCompressor,
-    cfg: PromptConfig = DEFAULT_PROMPT_CFG,
-    is_first_turn: bool = False,
-    class_naming: Optional[ClassNaming] = None,
-) -> Tuple[object, Dict]:
-    """
-    'one-class' input mode: present all images of one class together.
-
-    Layout:
-        user:      <user_tmpl> <embed1> <sep> <embed2> ... <embedN>
-        assistant: <asst_tmpl>
-
-    Returns:
-        (past_kv, info_dict)
-    """
-    device = llm.device
-    dtype  = llm.model_dtype
-
-    # Image embeddings: (N, num_patches, D)
-    imgs = images.to(device)
-    patches = img_tok(imgs).to(dtype)   # (N, num_patches, D)
-
-    # Flatten all patches into a single sequence with optional sep embeds
-    sep_emb = llm.embed_text(cfg.image_sep) if cfg.image_sep else None
-    vis_parts = []
-    for i in range(patches.shape[0]):
-        vis_parts.append(patches[i:i+1])    # (1, num_patches, D)
-        if sep_emb is not None and i < patches.shape[0] - 1:
-            vis_parts.append(sep_emb)
-    visual_embeds = torch.cat(vis_parts, dim=1)   # (1, total_tokens, D)
-
-    user_text = cfg.teach_user_tmpl.format(class_name=class_name)
-    asst_text = cfg.teach_asst_tmpl.format(class_name=class_name)
-
-    turn_emb, positions = builder.build_teaching_turn(
-        user_text=user_text,
-        visual_embeds=visual_embeds,
-        assistant_text=asst_text,
-        is_first_turn=is_first_turn,
-    )
-
-    prev_len = kv_seq_len(past_kv)
-    need_attn = isinstance(compressor, AttentionQueryCompressor) and (
-        getattr(cfg, "attractor_round", "assistant") == "turn_tail"
-    )
-    logits, past_kv, attn_maps = llm.prefill(
-        turn_emb, past_kv=past_kv, use_cache=True, output_attentions=need_attn
-    )
-
-    # Absolute positions of visual tokens in the full KV sequence
-    abs_vis = None
-    if "visual" in positions:
-        vs, ve = positions["visual"]
-        abs_vis = (prev_len + vs, prev_len + ve)
-
-    full_len = kv_seq_len(past_kv)
-    past_kv = compress_kv(
-        past_kv, compressor, llm, builder, class_naming,
-        data_range=abs_vis, cfg=cfg, in_turn_attentions=attn_maps
-    )
-    post_len = kv_seq_len(past_kv)
-
-    return past_kv, {
-        "tokens_added": full_len - prev_len,
-        "tokens_after_compress": post_len,
-        "visual_range": abs_vis,
-    }
-
-
-@torch.no_grad()
-def teach_mixed(
-    llm: LLMWrapper,
-    builder: EmbedBuilder,
-    img_tok: ImageTokenizer,
-    batch_images: List[torch.Tensor],  # list of (C, H, W)
-    batch_labels: List[str],           # corresponding class names
-    past_kv,
-    compressor: KVCacheCompressor,
-    cfg: PromptConfig = DEFAULT_PROMPT_CFG,
-    is_first_turn: bool = False,
-    class_naming: Optional[ClassNaming] = None,
-) -> Tuple[object, Dict]:
-    """
-    'mixed' input mode: interleave visual embeds and class labels in one turn.
-
-    Layout:
-        user:      <intro> <embed1> label1 <sep> <embed2> label2 ...
-        assistant: <mixed_asst_tmpl>
-    """
-    device = llm.device
-    dtype  = llm.model_dtype
-
-    stacked = torch.stack(batch_images).to(device)
-    patches = img_tok(stacked).to(dtype)  # (N, num_patches, D)
-
-    prefix = builder.chat.global_prefix if is_first_turn else builder.chat.turn_separator
-    sep_emb = llm.embed_text(cfg.mixed_label_sep) if cfg.mixed_label_sep else None
-
-    parts: List[torch.Tensor] = []
-
-    def _add(x: torch.Tensor):
-        x = x.to(device=device, dtype=dtype)
-        if x.shape[1] > 0:
-            parts.append(x)
-
-    _add(llm.embed_text(prefix))
-    if cfg.mixed_intro_tmpl:
-        _add(llm.embed_text(cfg.mixed_intro_tmpl))
-
-    vis_start = sum(p.shape[1] for p in parts)
-    for i, (label, patch) in enumerate(zip(batch_labels, patches)):
-        _add(patch.unsqueeze(0))                   # (1, num_patches, D)
-        _add(llm.embed_text(label))
-        if i < len(batch_labels) - 1 and sep_emb is not None:
-            _add(sep_emb)
-    vis_end = sum(p.shape[1] for p in parts)
-
-    _add(llm.embed_text(builder.chat.user_to_asst))
-    _add(llm.embed_text(cfg.mixed_asst_tmpl))
-    _add(llm.embed_text(builder.chat.asst_tail))
-
-    turn_emb = torch.cat(parts, dim=1)
-    prev_len = kv_seq_len(past_kv)
-
-    need_attn = isinstance(compressor, AttentionQueryCompressor) and (
-        getattr(cfg, "attractor_round", "assistant") == "turn_tail"
-    )
-    logits, past_kv, attn_maps = llm.prefill(
-        turn_emb, past_kv=past_kv, use_cache=True, output_attentions=need_attn
-    )
-
-    abs_vis = (prev_len + vis_start, prev_len + vis_end)
-    if need_attn:
-        assert attn_maps is not None
-    past_kv = compress_kv(
-        past_kv, compressor, llm, builder, class_naming,
-        data_range=abs_vis, cfg=cfg, in_turn_attentions=attn_maps
-    )
-    post_len = kv_seq_len(past_kv)
-
-    return past_kv, {
-        "tokens_added": kv_seq_len(past_kv) - prev_len,
-        "tokens_after_compress": post_len,
-        "visual_range": abs_vis,
-    }
-
-
-@torch.no_grad()
 def teach_guess_correct(
     llm: LLMWrapper,
     builder: EmbedBuilder,
@@ -1478,7 +1521,8 @@ def teach_guess_correct(
     past_kv,
     compressor: Optional[KVCacheCompressor] = None,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
-    is_first_turn: bool = False,
+    answer_mode: str = "first_token",
+    temperature: float = 0.0,
     guess_prob_gt: float = 0.0,
     guess_prob_random: float = 0.0,
 ) -> Tuple[object, bool, str]:
@@ -1492,39 +1536,44 @@ def teach_guess_correct(
                  assistant: "correct, <class>" or "wrong, it is <class>"
 
     Guess mode flags:
-        guess_prob_gt: probability of assistant guessing true ground truth instead of argmax (0=argmax, 1=always true)
-        guess_prob_random: probability of assistant guessing random label instead of argmax (0=argmax, 1=always random)
+        guess_prob_gt: legacy probability of replacing the sampled prediction with ground truth
+        guess_prob_random: legacy probability of replacing the sampled prediction with a random label
 
     Returns:
         (past_kv, was_correct, guessed_class_name)
     """
-    device = llm.device
-    dtype  = llm.model_dtype
-
-    patches = img_tok(image.unsqueeze(0).to(device)).to(dtype)  # (1, num_patches, D)
-
-    # -- Turn 1: show visual, ask model to predict --
-    q_emb, _ = builder.build_query_turn(
-        user_text=cfg.guess_user_tmpl,
-        visual_embeds=patches,
-        is_first_turn=is_first_turn,
+    guessed_name, _, past_kv_q = predict_image(
+        llm, builder, img_tok, image, class_naming, past_kv,
+        cfg=cfg, answer_mode=answer_mode, temperature=temperature,
+        keep_query_cache=True,
+        prompt_context="teaching guess-correct / prediction",
     )
-    logits, past_kv_q, _ = llm.prefill(q_emb, past_kv=past_kv, use_cache=True)
-    next_logits = logits[0, -1, :]      # (vocab_size,)
-    argmax_name = _argmax_class(llm, next_logits, class_naming)
 
-    # Decide assistant guess:
-    # 1. guess_prob_gt: interpolate between argmax and always true GT
-    # 2. guess_prob_random: interpolate between argmax and always random label
+    # Legacy experiment overrides; both are disabled by default.
     if guess_prob_gt > 0.0 and random.random() < guess_prob_gt:
         guessed_name = true_class_name
     elif guess_prob_random > 0.0 and random.random() < guess_prob_random:
         guessed_name = random.choice(class_naming.names)
-    else:
-        guessed_name = argmax_name
+
+    if cfg.verbose and (guess_prob_gt > 0.0 or guess_prob_random > 0.0):
+        query_text = _format_class_prompt(
+            cfg.guess_user_tmpl,
+            class_naming,
+            include_options=cfg.include_class_options,
+        )
+        _log_prompt_exchange(
+            "legacy teaching guess override",
+            _render_embedded_images(query_text, patch_count=img_tok.num_patches),
+            guessed_name,
+        )
 
     # Append guessed_name as assistant response
-    pred_emb = llm.embed_text(guessed_name + builder.chat.asst_tail)
+    device = llm.device
+    dtype = llm.model_dtype
+    pred_emb = llm.embed_text(
+        " " + guessed_name + builder.chat.asst_tail,
+        add_special_tokens=False,
+    )
     pred_emb = pred_emb.to(device=device, dtype=dtype)
     _, past_kv_q, _ = llm.prefill(pred_emb, past_kv=past_kv_q, use_cache=True)
 
@@ -1534,6 +1583,13 @@ def teach_guess_correct(
         asst_feedback = cfg.guess_correct_asst.format(class_name=true_class_name)
     else:
         asst_feedback = cfg.guess_wrong_asst.format(class_name=true_class_name)
+
+    if cfg.verbose:
+        _log_prompt_exchange(
+            "teaching guess-correct / feedback",
+            cfg.guess_correct_user.format(class_name=true_class_name),
+            asst_feedback,
+        )
 
     fb_emb, _ = builder.build_teaching_turn(
         user_text=cfg.guess_correct_user.format(class_name=true_class_name),
@@ -1557,7 +1613,7 @@ def teach_guess_correct(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def classify_image(
+def predict_image(
     llm: LLMWrapper,
     builder: EmbedBuilder,
     img_tok: ImageTokenizer,
@@ -1566,84 +1622,164 @@ def classify_image(
     past_kv,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     answer_mode: str = "first_token",
-) -> Tuple[str, Dict[str, float]]:
+    temperature: float = 0.0,
+    keep_query_cache: bool = False,
+    prompt_context: str = "test/evaluation",
+) -> Tuple[str, Dict[str, float], object]:
     """
-    Classify a single test image given the accumulated KV cache.
-
-    Parameters
-    ----------
-    answer_mode : 'first_token' | 'full_prob'
-        first_token - compare softmax probability of first token of each class name.
-        full_prob   - compare summed log-prob of full class name token sequence.
-
-    Returns
-    -------
-    (predicted_class_name, {name: score})
+    Build the shared image query, then sample a class from its next-token scores.
+    Teaching retains the query cache to append the answer and feedback; evaluation
+    discards it after using the identical prompt and sampling path.
     """
+    if answer_mode not in ("first_token", "full_prob"):
+        raise ValueError(f"Unknown answer_mode: {answer_mode}")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
     device = llm.device
     dtype  = llm.model_dtype
 
     patches = img_tok(image.unsqueeze(0).to(device)).to(dtype)  # (1, N, D)
 
-    q_emb, positions = builder.build_query_turn(
-        user_text=cfg.test_user_tmpl,
+    query_text = _format_class_prompt(
+        cfg.guess_user_tmpl, class_naming,
+        include_options=cfg.include_class_options or answer_mode == "full_prob",
+    )
+    q_emb, _ = builder.build_query_turn(
+        user_text=query_text,
         visual_embeds=patches,
         is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
     )
 
-    if answer_mode == "first_token":
-        logits, _, _ = llm.prefill(q_emb, past_kv=past_kv, use_cache=False)
-        next_logits = logits[0, -1, :]     # (vocab_size,)
-        probs = torch.softmax(next_logits, dim=-1)
-        scores = {}
-        for name in class_naming.names:
-            tid = llm.tokenizer(name, return_tensors="pt").input_ids[0, 0].item()
-            scores[name] = probs[tid].item()
+    label_tokens = [_class_token_ids(llm, name) for name in class_naming.names]
+    has_shared_prefix = len({tokens[0] for tokens in label_tokens}) < len(label_tokens)
+    needs_sequence_scores = answer_mode == "full_prob" or has_shared_prefix
+    retain_query_cache = keep_query_cache or needs_sequence_scores
 
-    elif answer_mode == "full_prob":
-        # Prefill context first, then score each class name sequence
-        _, ctx_kv, _ = llm.prefill(q_emb, past_kv=past_kv, use_cache=True)
-        scores = {}
-        for name in class_naming.names:
-            log_p = _sequence_log_prob(llm, name, ctx_kv)
-            scores[name] = log_p
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-    else:
-        raise ValueError(f"Unknown answer_mode: {answer_mode}")
+    # Cache is mutable in some Transformers implementations. Avoid mutating the
+    # taught context during full-sequence evaluation.
+    query_context = past_kv
+    if needs_sequence_scores and not keep_query_cache:
+        query_context = copy.deepcopy(past_kv)
+    logits, query_kv, _ = llm.prefill(
+        q_emb, past_kv=query_context, use_cache=retain_query_cache
+    )
+    next_logits = logits[0, -1, :]
+    predicted, scores = sample_class(
+        llm, next_logits, class_naming, answer_mode=answer_mode,
+        temperature=temperature,
+        ctx_kv=query_kv,
+    )
+    if cfg.verbose:
+        _log_query_and_extraction(
+            prompt_context,
+            query_text,
+            patch_count=patches.shape[1],
+            chat=builder.chat,
+            answer_mode=answer_mode,
+            temperature=temperature,
+            scores=scores,
+            selected=predicted,
+        )
+    return predicted, scores, query_kv
 
-    predicted = max(scores, key=scores.get)
+
+def classify_image(
+    llm: LLMWrapper,
+    builder: EmbedBuilder,
+    img_tok: ImageTokenizer,
+    image: torch.Tensor,
+    class_naming: ClassNaming,
+    past_kv,
+    cfg: PromptConfig = DEFAULT_PROMPT_CFG,
+    answer_mode: str = "first_token",
+    temperature: float = 0.0,
+) -> Tuple[str, Dict[str, float]]:
+    """Evaluation wrapper around the same predictor used during teaching."""
+    predicted, scores, _ = predict_image(
+        llm, builder, img_tok, image, class_naming, past_kv,
+        cfg=cfg, answer_mode=answer_mode, temperature=temperature,
+        keep_query_cache=False,
+    )
     return predicted, scores
 
 
-def _argmax_class(llm: LLMWrapper, logits: torch.Tensor, class_naming: ClassNaming) -> str:
-    """Given (vocab_size,) logits, pick the class whose first token has highest prob."""
-    probs = torch.softmax(logits, dim=-1)
-    best, best_p = class_naming.names[0], -1.0
-    for name in class_naming.names:
-        tid = llm.tokenizer(name, return_tensors="pt").input_ids[0, 0].item()
-        p = probs[tid].item()
-        if p > best_p:
-            best_p = p
-            best = name
-    return best
+def _class_token_ids(llm: LLMWrapper, name: str) -> List[int]:
+    """Tokenize a generated label without BOS/EOS, including its leading space."""
+    ids = llm.tokenizer(" " + name, add_special_tokens=False).input_ids
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    if not ids:
+        raise ValueError(f"Class label {name!r} produced no tokens")
+    return [int(token_id) for token_id in ids]
+
+
+def sample_class(
+    llm: LLMWrapper,
+    logits: torch.Tensor,
+    class_naming: ClassNaming,
+    answer_mode: str = "first_token",
+    temperature: float = 0.0,
+    ctx_kv=None,
+) -> Tuple[str, Dict[str, float]]:
+    """Sample a candidate label; temperature 0 selects the greedy maximum."""
+    if answer_mode not in ("first_token", "full_prob"):
+        raise ValueError(f"Unknown answer_mode: {answer_mode}")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    token_ids = [_class_token_ids(llm, name) for name in class_naming.names]
+    first_ids = [ids[0] for ids in token_ids]
+    if answer_mode == "full_prob" or len(set(first_ids)) != len(first_ids):
+        if ctx_kv is None:
+            raise ValueError("Full-label sampling requires the query KV cache")
+        scores = {
+            name: _sequence_log_prob(llm, name, ctx_kv, first_logits=logits)
+            for name in class_naming.names
+        }
+    else:
+        scores = {
+            name: logits[token_sequence[0]].item()
+            for name, token_sequence in zip(class_naming.names, token_ids)
+        }
+
+    if temperature == 0.0:
+        selected = max(scores, key=scores.get)
+    else:
+        label_scores = torch.tensor(
+            [scores[name] for name in class_naming.names],
+            device=logits.device,
+            dtype=torch.float32,
+        )
+        probabilities = torch.softmax(label_scores / temperature, dim=0)
+        selected_index = torch.multinomial(probabilities, num_samples=1).item()
+        selected = class_naming.names[selected_index]
+    return selected, scores
 
 
 @torch.no_grad()
-def _sequence_log_prob(llm: LLMWrapper, text: str, ctx_kv) -> float:
+def _sequence_log_prob(
+    llm: LLMWrapper,
+    text: str,
+    ctx_kv,
+    first_logits: Optional[torch.Tensor] = None,
+) -> float:
     """
-    Compute sum of log-probs of tokens in `text` conditioned on `ctx_kv`.
+    Compute the generated-label log probability conditioned on the query context.
     """
-    ids = llm.tokenizer(text, return_tensors="pt").input_ids.to(llm.device)
-    emb = llm.model.get_input_embeddings()(ids).to(llm.model_dtype)
-
+    token_ids = _class_token_ids(llm, text)
+    if first_logits is None:
+        raise ValueError("first_logits are required to score a label continuation")
     log_p = 0.0
-    cur_kv = ctx_kv
-    for t in range(emb.shape[1]):
-        tok_emb = emb[:, t:t+1]
-        logits, cur_kv, _ = llm.prefill(tok_emb, past_kv=cur_kv, use_cache=True)
-        log_p += torch.log_softmax(logits[0, 0], dim=-1)[ids[0, t]].item()
+    cur_kv = copy.deepcopy(ctx_kv)
+    current_logits = first_logits
+    for index, token_id in enumerate(token_ids):
+        log_p += torch.log_softmax(current_logits, dim=-1)[token_id].item()
+        if index + 1 < len(token_ids):
+            ids = torch.tensor([[token_id]], device=llm.device)
+            tok_emb = llm.model.get_input_embeddings()(ids).to(llm.model_dtype)
+            logits, cur_kv, _ = llm.prefill(
+                tok_emb, past_kv=cur_kv, use_cache=True
+            )
+            current_logits = logits[0, -1]
     return log_p
 
 
@@ -1657,6 +1793,7 @@ def evaluate_dataset(
     past_kv,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     answer_mode: str = "first_token",
+    temperature: float = 0.0,
     verbose: bool = False,
     desc: str = "Evaluating",
 ) -> Tuple[float, List[str], List[str]]:
@@ -1673,6 +1810,7 @@ def evaluate_dataset(
     past_kv       : Accumulated KV cache
     cfg           : PromptConfig
     answer_mode   : 'first_token' or 'full_prob'
+    temperature   : Class-sampling temperature; 0 is greedy argmax
     verbose       : If True, log every single image classification
     desc          : Progress bar description
 
@@ -1701,6 +1839,7 @@ def evaluate_dataset(
                     past_kv=past_kv,
                     cfg=cfg,
                     answer_mode=answer_mode,
+                    temperature=temperature,
                 )
             except Exception as e:
                 logging.error(f"Error classifying {cls_name} img {img_idx}: {e}")
@@ -1750,21 +1889,172 @@ def load_cifar10(data_dir: str, train: bool = True) -> torchvision.datasets.CIFA
     )
 
 
-def subset_per_class(
+def subset_dataset(
     dataset,
-    n_per_class: int,
+    subset_size: Union[int, float],
+    balanced: bool = True,
+    seed: Optional[int] = 0,
 ) -> Dict[int, List[torch.Tensor]]:
+    """Select a total-size subset from a dataset, optionally balanced by class.
+
+    Integer sizes count examples across the whole dataset. A float in [0, 1]
+    selects that fraction of the whole dataset. Balanced selection divides the
+    requested total as evenly as possible among classes. Unbalanced selection
+    takes the first requested examples in dataset order.
     """
-    Return a dict mapping class_id -> list of image tensors (up to n_per_class each).
-    Images are taken in dataset order (first N per class).
-    """
-    class_buckets: Dict[int, List] = {i: [] for i in range(10)}
-    for img, label in dataset:
-        if len(class_buckets[label]) < n_per_class:
-            class_buckets[label].append(img)
-        if all(len(v) >= n_per_class for v in class_buckets.values()):
-            break
+    _validate_subset_spec(subset_size, "subset size")
+    total_size = _resolve_subset_count(subset_size, len(dataset))
+    targets = getattr(dataset, "targets", None)
+    if targets is None:
+        records = [dataset[index] for index in range(len(dataset))]
+        targets = [int(label) for _, label in records]
+    else:
+        records = None
+        targets = [int(label) for label in targets]
+
+    class_ids = sorted(set(targets))
+    selected_indices: List[int]
+    if not balanced:
+        selected_indices = list(range(total_size))
+    else:
+        indices_by_class: Dict[int, List[int]] = {class_id: [] for class_id in class_ids}
+        for index, class_id in enumerate(targets):
+            indices_by_class[class_id].append(index)
+
+        selection_rng = random.Random(seed) if seed is not None else None
+        if selection_rng is not None:
+            for class_indices in indices_by_class.values():
+                selection_rng.shuffle(class_indices)
+            remainder_order = list(class_ids)
+            selection_rng.shuffle(remainder_order)
+        else:
+            remainder_order = list(class_ids)
+
+        per_class = {class_id: 0 for class_id in class_ids}
+        remaining = total_size
+        while remaining > 0:
+            progressed = False
+            for class_id in remainder_order:
+                if per_class[class_id] < len(indices_by_class[class_id]):
+                    per_class[class_id] += 1
+                    remaining -= 1
+                    progressed = True
+                    if remaining == 0:
+                        break
+            if not progressed:
+                break
+        selected_indices = [
+            index
+            for class_id in class_ids
+            for index in indices_by_class[class_id][:per_class[class_id]]
+        ]
+        selected_indices.sort()
+
+    class_buckets: Dict[int, List[torch.Tensor]] = {class_id: [] for class_id in class_ids}
+    for index in selected_indices:
+        if records is None:
+            image, label = dataset[index]
+        else:
+            image, label = records[index]
+        class_buckets[int(label)].append(image)
     return class_buckets
+
+
+def _validate_subset_spec(value: Union[int, float], name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be an integer count or a fraction in [0, 1]")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{name} count must be non-negative")
+    elif not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} fraction must be in [0, 1]")
+
+
+def _parse_subset_spec(value: str) -> Union[int, float]:
+    """Parse integer counts or decimal proportions for CLI sample sizes."""
+    try:
+        parsed: Union[int, float]
+        if "." not in value and "e" not in value.lower():
+            parsed = int(value)
+        else:
+            parsed = float(value)
+        _validate_subset_spec(parsed, "subset size")
+        return parsed
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _parse_seed(value: str) -> Optional[int]:
+    if value.strip().lower() in ("none", "null"):
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("seed must be an integer or None") from exc
+
+
+def _resolve_subset_count(value: Union[int, float], available: int) -> int:
+    _validate_subset_spec(value, "subset size")
+    requested = math.floor(available * value) if isinstance(value, float) else value
+    return min(requested, available)
+
+
+def _subset_buckets_by_total(
+    data_by_class: Dict[int, List[torch.Tensor]],
+    total_size: int,
+    balanced: bool = True,
+) -> Dict[int, List[torch.Tensor]]:
+    """Take a total-size subset from existing class buckets."""
+    class_ids = sorted(data_by_class)
+    result = {class_id: [] for class_id in class_ids}
+    remaining = min(total_size, sum(len(data_by_class[cid]) for cid in class_ids))
+    if not balanced:
+        for class_id in class_ids:
+            take = min(remaining, len(data_by_class[class_id]))
+            result[class_id] = data_by_class[class_id][:take]
+            remaining -= take
+            if remaining == 0:
+                break
+        return result
+
+    per_class = {class_id: 0 for class_id in class_ids}
+    while remaining > 0:
+        progressed = False
+        for class_id in class_ids:
+            if per_class[class_id] < len(data_by_class[class_id]):
+                per_class[class_id] += 1
+                remaining -= 1
+                progressed = True
+                if remaining == 0:
+                    break
+        if not progressed:
+            break
+    return {
+        class_id: data_by_class[class_id][:per_class[class_id]]
+        for class_id in class_ids
+    }
+
+
+def build_training_pairs(
+    data_by_class: Dict[int, List[torch.Tensor]],
+    class_naming: ClassNaming,
+    balanced: bool = True,
+    seed: Optional[int] = 0,
+    epoch: int = 1,
+) -> List[Tuple[torch.Tensor, str]]:
+    """Build per-image training examples, optionally equalizing class counts."""
+    counts = [len(data_by_class.get(cid, [])) for cid in range(len(class_naming.classes))]
+    per_class_count = min(counts, default=0) if balanced else None
+    pairs = [
+        (image, class_naming.name(class_id))
+        for class_id in range(len(class_naming.classes))
+        for image in data_by_class.get(class_id, [])[
+            :per_class_count if per_class_count is not None else None
+        ]
+    ]
+    if seed is not None:
+        random.Random(seed + epoch - 1).shuffle(pairs)
+    return pairs
 
 
 def plot_confusion_matrix(
@@ -1845,42 +2135,49 @@ def parse_args():
     p.add_argument("--attractor-asst-prompt", type=str, default=None,
                    help="Override assistant prompt for attractor query")
 
-    # Input / teaching mode
-    p.add_argument("--input-mode",
-                   choices=["one-class", "mixed", "guess-correct"],
-                   default="mixed")
-    p.add_argument("--train-per-class", type=int, default=100,
-                   help="Training images per class")
-    p.add_argument("--test-per-class", type=int, default=10,
-                   help="Test images per class")
+    p.add_argument("--train-samples", type=_parse_subset_spec, default=100,
+                   help="Total training subset size: integer count or fraction in [0, 1] (default: 100)")
+    p.add_argument("--test-samples", type=_parse_subset_spec, default=100,
+                   help="Total test subset size: integer count or fraction in [0, 1] (default: 100)")
+    p.add_argument("--seed", type=_parse_seed, default=0,
+                   help="Training shuffle/random seed (default: 0); use None for ordered training")
+    p.add_argument("--balanced-sampling", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Balance the total train/test subset across classes (default: enabled)")
     p.add_argument("--teaching-epochs", type=int, default=2,
                    help="Number of teaching passes over training data")
-    p.add_argument("--batch-size", type=int, default=10,
-                   help="Images per teaching batch (for mixed mode)")
-    p.add_argument("--guess-prob-gt", type=float, default=0.9,
-                   help="Probability of assistant guessing true ground truth instead of argmax (0=argmax, 1=always true GT)")
-    p.add_argument("--guess-prob-random", type=float, default=0.1,
-                   help="Probability of assistant guessing random label instead of argmax (0=argmax, 1=always random)")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="Class sampling temperature for both teaching and evaluation (0=greedy argmax)")
+    p.add_argument("--answer-mode", choices=["first_token", "full_prob"],
+                   default="first_token",
+                   help="Score candidate labels by first token or complete token sequence")
+    p.add_argument("--guess-prob-gt", type=float, default=0.0,
+                   help="Legacy experiment: probability of replacing the sampled teaching guess with ground truth")
+    p.add_argument("--guess-prob-random", type=float, default=0.0,
+                   help="Legacy experiment: probability of replacing the sampled teaching guess with a random label")
     p.add_argument("--eval-every", type=int, default=1,
                    help="Evaluate validation/test accuracy every N epochs (and at the final epoch)")
-    p.add_argument("--train-eval-per-class", type=int, default=None,
-                   help="Number of training images per class to evaluate train accuracy (default: min(train_per_class, test_per_class))")
+    p.add_argument("--train-eval-samples", type=_parse_subset_spec, default=None,
+                   help="Total training examples for post-teaching evaluation; integer or fraction (default: min selected train/test total)")
     p.add_argument("--skip-val", action="store_true", default=False,
                    help="Skip validation/test evaluation passes")
     p.add_argument("--sanity-check", action="store_true", default=False,
-                   help="Sanity check mode: evaluate on training images (first --test-per-class per class) to test recall")
+                   help="Sanity check mode: evaluate on a subset of training images to test recall")
     p.add_argument("--verbose", action="store_true", default=False,
                    help="Enable verbose per-image logging during evaluation and teaching")
 
-    # Class names
+    # Class labels
     p.add_argument("--generic-class-names", action="store_true", default=False,
-                   help="Use class1, class2, ... instead of real names")
+                   help="Deprecated alias for --class-label-mode generic")
+    p.add_argument("--class-label-mode", "--label-style",
+                   dest="class_label_mode",
+                   choices=["direct", "letters", "mc_letters", "digits", "mc_digits", "generic"],
+                   default="direct",
+                   help="Labels used for teaching and prediction (default: direct)")
+    p.add_argument("--include-class-options", action="store_true", default=False,
+                   help="Make guess-correct query prompts list each label and its CIFAR-10 class")
     p.add_argument("--disable-instruction", action="store_true", default=False,
                    help="Disable the first-round instruction prompt turn")
-
-    # Classification
-    p.add_argument("--answer-mode", choices=["first_token", "full_prob"],
-                   default="first_token")
 
     # Data / logging
     p.add_argument("--data-dir", default="./datasets")
@@ -1905,6 +2202,16 @@ def parse_args():
         "auto": None, "float32": torch.float32,
         "float16": torch.float16, "bfloat16": torch.bfloat16,
     }[args.dtype]
+    _validate_subset_spec(args.train_samples, "--train-samples")
+    _validate_subset_spec(args.test_samples, "--test-samples")
+    if args.train_eval_samples is not None:
+        _validate_subset_spec(args.train_eval_samples, "--train-eval-samples")
+    if args.temperature < 0:
+        p.error("--temperature must be non-negative")
+    if not 0.0 <= args.guess_prob_gt <= 1.0:
+        p.error("--guess-prob-gt must be between 0 and 1")
+    if not 0.0 <= args.guess_prob_random <= 1.0:
+        p.error("--guess-prob-random must be between 0 and 1")
 
     return args
 
@@ -1963,6 +2270,12 @@ def main():
     setup_logging(args.log_dir, level=args.log_level)
     log_dir = Path(args.log_dir)
 
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
     logging.info("=" * 70)
     logging.info("LLM Learner")
     logging.info("=" * 70)
@@ -1975,32 +2288,54 @@ def main():
     # -------------------------------------------------------------------
     logging.info("\nLoading CIFAR-10 ...")
     train_ds = load_cifar10(args.data_dir, train=True)
-    train_by_class = subset_per_class(train_ds, args.train_per_class)
-
-    # Train evaluation subset (for tracking train acc across epochs)
-    train_eval_n = (
-        args.train_eval_per_class
-        if args.train_eval_per_class is not None
-        else min(args.train_per_class, args.test_per_class)
+    train_by_class = subset_dataset(
+        train_ds,
+        args.train_samples,
+        balanced=args.balanced_sampling,
+        seed=args.seed,
     )
-    train_eval_by_class = {
-        cls_id: imgs[:train_eval_n]
-        for cls_id, imgs in train_by_class.items()
-    } if train_eval_n > 0 else {}
 
     # Validation/Test dataset
     if args.skip_val:
         logging.info("Validation evaluation is skipped (--skip-val)")
         test_by_class = {}
     elif args.sanity_check:
-        logging.info(f"SANITY CHECK MODE: Testing on training images (first {args.test_per_class} per class)")
-        test_by_class = {
-            cls_id: imgs[:args.test_per_class]
-            for cls_id, imgs in train_by_class.items()
-        }
+        logging.info("SANITY CHECK MODE: Testing on the selected training subset")
+        test_by_class = subset_dataset(
+            train_ds,
+            args.test_samples,
+            balanced=args.balanced_sampling,
+            seed=args.seed,
+        )
     else:
         test_ds  = load_cifar10(args.data_dir, train=False)
-        test_by_class = subset_per_class(test_ds, args.test_per_class)
+        test_by_class = subset_dataset(
+            test_ds,
+            args.test_samples,
+            balanced=args.balanced_sampling,
+            seed=args.seed,
+        )
+
+    # Post-teaching train evaluation uses the smaller selected dataset subset
+    # by default; an explicit integer or fraction can override that size.
+    train_selected_total = sum(len(images) for images in train_by_class.values())
+    test_selected_total = sum(len(images) for images in test_by_class.values())
+    if args.train_eval_samples is None:
+        train_eval_total = min(
+            train_selected_total,
+            test_selected_total if test_by_class else train_selected_total,
+        )
+    else:
+        train_eval_total = _resolve_subset_count(
+            args.train_eval_samples,
+            len(train_ds),
+        )
+        train_eval_total = min(train_eval_total, train_selected_total)
+    train_eval_by_class = _subset_buckets_by_total(
+        train_by_class,
+        train_eval_total,
+        balanced=args.balanced_sampling,
+    )
 
     n_train_total = sum(len(v) for v in train_by_class.values())
     n_train_eval_total = sum(len(v) for v in train_eval_by_class.values())
@@ -2013,7 +2348,11 @@ def main():
     # -------------------------------------------------------------------
     # Class naming
     # -------------------------------------------------------------------
-    class_naming = ClassNaming(CIFAR10_CLASSES, use_generic=args.generic_class_names)
+    class_naming = ClassNaming(
+        CIFAR10_CLASSES,
+        use_generic=args.generic_class_names,
+        label_mode=args.class_label_mode,
+    )
     if class_naming.use_generic:
         mapping_str = ", ".join(f"{class_naming.name(i)}: {class_naming.original(i)}" for i in range(len(CIFAR10_CLASSES)))
         logging.info(f"Class names (generic mode): {mapping_str}")
@@ -2081,7 +2420,11 @@ def main():
     logging.info("=" * 70)
 
     past_kv    = None
-    prompt_cfg = DEFAULT_PROMPT_CFG
+    prompt_cfg = PromptConfig()
+    prompt_cfg.include_class_options = (
+        args.include_class_options or args.answer_mode == "full_prob"
+    )
+    prompt_cfg.verbose = args.verbose
     if args.disable_instruction:
         prompt_cfg.use_instruction_turn = False
     prompt_cfg.attractor_round = args.attractor_round
@@ -2091,6 +2434,15 @@ def main():
         prompt_cfg.attractor_query_user_prompt = args.attractor_user_prompt
     if args.attractor_asst_prompt is not None:
         prompt_cfg.attractor_asst_prompt = args.attractor_asst_prompt
+
+    _log_prompt_catalog(
+        prompt_cfg,
+        class_naming,
+        chat_segs,
+        answer_mode=args.answer_mode,
+        temperature=args.temperature,
+        attractor_round=args.attractor_round,
+    )
 
     if prompt_cfg.use_instruction_turn and prompt_cfg.instruction_user_prompt:
         logging.info("Prefilling first-round instruction prompt...")
@@ -2106,98 +2458,53 @@ def main():
     for epoch in epoch_pbar:
         logging.info(f"\n-- Epoch {epoch}/{args.teaching_epochs} --")
 
-        if args.input_mode == "one-class":
-            class_pbar = tqdm(range(len(CIFAR10_CLASSES)), desc=f"Ep {epoch} Teaching", leave=False, dynamic_ncols=True)
-            for cls_id in class_pbar:
-                cls_name = class_naming.name(cls_id)
-                cls_disp = class_naming.display_name(cls_id)
-                images   = train_by_class[cls_id]
-                if not images:
-                    continue
-
-                images_tensor = torch.stack(images)   # (N, C, H, W)
-                prev_len = kv_seq_len(past_kv)
-                if args.verbose:
-                    logging.info(f"  Teaching '{cls_disp}' ({len(images)} imgs), cache={prev_len}")
-
-                past_kv, info = teach_one_class(
-                    llm, builder, img_tok,
-                    class_name=cls_name,
-                    images=images_tensor,
-                    past_kv=past_kv,
-                    compressor=compressor,
-                    cfg=prompt_cfg,
-                    is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
-                    class_naming=class_naming,
+        training_pairs = build_training_pairs(
+            train_by_class,
+            class_naming,
+            balanced=args.balanced_sampling,
+            seed=args.seed,
+            epoch=epoch,
+        )
+        correct_count = 0
+        train_pbar = tqdm(
+            enumerate(training_pairs),
+            total=len(training_pairs),
+            desc=f"Ep {epoch} Online Teaching",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for index, (image, true_name) in train_pbar:
+            past_kv, was_correct, predicted = teach_guess_correct(
+                llm, builder, img_tok, image, true_name, class_naming,
+                past_kv, compressor=compressor, cfg=prompt_cfg,
+                answer_mode=args.answer_mode,
+                temperature=args.temperature,
+                guess_prob_gt=args.guess_prob_gt,
+                guess_prob_random=args.guess_prob_random,
+            )
+            correct_count += int(was_correct)
+            acc = correct_count / (index + 1) * 100.0
+            train_pbar.set_postfix({
+                "online": f"{acc:.1f}%",
+                "cache": kv_seq_len(past_kv),
+            })
+            if args.verbose and ((index + 1) % 10 == 0 or index == 0):
+                logging.info(
+                    "  img %d/%d: true=%s, pred=%s %s "
+                    "(pre-feedback online accuracy=%.1f%%, cache=%d)",
+                    index + 1,
+                    len(training_pairs),
+                    class_naming.display_name(true_name),
+                    class_naming.display_name(predicted),
+                    "✓" if was_correct else "✗",
+                    acc,
+                    kv_seq_len(past_kv),
                 )
-                if args.verbose:
-                    logging.info(f"    -> +{info['tokens_added']} tokens, "
-                                 f"cache after compress: {info['tokens_after_compress']}")
-                class_pbar.set_postfix({"cls": cls_disp, "cache": kv_seq_len(past_kv)})
-
-        elif args.input_mode == "mixed":
-            all_imgs: List[torch.Tensor] = []
-            all_lbls: List[str] = []
-            for cls_id in range(len(CIFAR10_CLASSES)):
-                for img in train_by_class[cls_id]:
-                    all_imgs.append(img)
-                    all_lbls.append(class_naming.name(cls_id))
-
-            pairs = list(zip(all_imgs, all_lbls))
-            random.shuffle(pairs)
-            all_imgs_s, all_lbls_s = zip(*pairs) if pairs else ([], [])
-
-            bs = args.batch_size
-            is_first = (past_kv is None or kv_seq_len(past_kv) == 0)
-            batch_indices = list(range(0, len(all_imgs_s), bs))
-            batch_pbar = tqdm(batch_indices, desc=f"Ep {epoch} Teaching (mixed)", leave=False, dynamic_ncols=True)
-            for step_idx, i in enumerate(batch_pbar):
-                b_imgs = list(all_imgs_s[i:i+bs])
-                b_lbls = list(all_lbls_s[i:i+bs])
-                prev_len = kv_seq_len(past_kv)
-                if args.verbose:
-                    logging.info(f"  Mixed batch {i//bs + 1}: {len(b_imgs)} items, cache={prev_len}")
-                past_kv, info = teach_mixed(
-                    llm, builder, img_tok, b_imgs, b_lbls, past_kv, compressor,
-                    cfg=prompt_cfg, is_first_turn=(is_first and i == 0),
-                    class_naming=class_naming,
-                )
-                if args.verbose:
-                    logging.info(f"    -> cache after compress: {info['tokens_after_compress']}")
-                batch_pbar.set_postfix({"batch": f"{step_idx+1}/{len(batch_indices)}", "cache": kv_seq_len(past_kv)})
-
-        elif args.input_mode == "guess-correct":
-            all_imgs  = []
-            all_cls_ids = []
-            for cls_id in range(len(CIFAR10_CLASSES)):
-                for img in train_by_class[cls_id]:
-                    all_imgs.append(img)
-                    all_cls_ids.append(cls_id)
-
-            correct_count = 0
-            is_first = (past_kv is None or kv_seq_len(past_kv) == 0)
-            guess_pbar = tqdm(enumerate(zip(all_imgs, all_cls_ids)), total=len(all_imgs), desc=f"Ep {epoch} Guess-Correct", leave=False, dynamic_ncols=True)
-            for i, (img, cls_id) in guess_pbar:
-                cls_name = class_naming.name(cls_id)
-                past_kv, was_correct, predicted = teach_guess_correct(
-                    llm, builder, img_tok, img, cls_name, class_naming,
-                    past_kv, compressor=compressor, cfg=prompt_cfg,
-                    is_first_turn=(is_first and i == 0),
-                    guess_prob_gt=args.guess_prob_gt,
-                    guess_prob_random=args.guess_prob_random,
-                )
-                correct_count += int(was_correct)
-                acc = correct_count / (i + 1) * 100
-                guess_pbar.set_postfix({"acc": f"{acc:.1f}%", "cache": kv_seq_len(past_kv)})
-                if args.verbose and ((i + 1) % 10 == 0 or i == 0):
-                    true_disp = class_naming.display_name(cls_id)
-                    pred_disp = class_naming.display_name(predicted)
-                    logging.info(
-                        f"  img {i+1}/{len(all_imgs)}: "
-                        f"true={true_disp}, pred={pred_disp} "
-                        f"{'✓' if was_correct else '✗'} "
-                        f"(running acc={acc:.1f}%, cache={kv_seq_len(past_kv)})"
-                    )
+        logging.info(
+            "Epoch %d online pre-feedback teaching accuracy: %.2f%%",
+            epoch,
+            acc if training_pairs else 0.0,
+        )
 
         # Periodic evaluation (every eval_every epochs, plus final epoch)
         is_last_epoch = (epoch == args.teaching_epochs)
@@ -2215,6 +2522,7 @@ def main():
                     llm, builder, img_tok, train_eval_by_class,
                     class_naming=class_naming, past_kv=past_kv,
                     cfg=prompt_cfg, answer_mode=args.answer_mode,
+                    temperature=args.temperature,
                     verbose=args.verbose, desc=f"Ep {epoch} Eval (Train)",
                 )
 
@@ -2223,6 +2531,7 @@ def main():
                     llm, builder, img_tok, test_by_class,
                     class_naming=class_naming, past_kv=past_kv,
                     cfg=prompt_cfg, answer_mode=args.answer_mode,
+                    temperature=args.temperature,
                     verbose=args.verbose, desc=f"Ep {epoch} Eval (Val)",
                 )
 
