@@ -40,7 +40,7 @@ python exps/llm_learner.py --generic-class-names --model-name HuggingFaceTB/Smol
 --kv-policy attn_query --kv-sink 512 --kv-topk 2048 --neighbor-window 1 1 \
 --attractor-round turn_tail --attractor-temporary \
 --teaching-epochs 2 \
---eval-every 1 --train-eval-samples 100 --answer-mode full_prob --temperature 0.0 --guess-prob-gt 0.0 --guess-prob-random 0.0
+--eval-every 1 --train-eval-samples 100 --answer-mode full_prob --rank-k 3 --no-sample-ranking --reasoning --reasoning-max-new-tokens 24 --reasoning-temperature 0.7 --reasoning-top-p 0.9 --guess-prob-gt 0.0 --guess-prob-random 0.0
 python exps/llm_learner.py --img-mode byte_embeds --img-reduction sum
 python exps/llm_learner.py --kv-policy streaming --kv-sink 4 --kv-last 128
 python exps/llm_learner.py --kv-policy attn_query --kv-topk 128 \
@@ -83,6 +83,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+DEFAULT_REASONING_MAX_WORDS = 128
 
 CIFAR10_CLASSES = [
     "airplane", "automobile", "bird", "cat", "deer",
@@ -902,11 +904,15 @@ class AttentionQueryCompressor(KVCacheCompressor):
             return self.compress(past_kv, attention_maps=in_turn_attentions, data_range=data_range)
 
         # Mode B: separate attractor query prefill ('user' or 'assistant')
-        class_names_list = ", ".join(class_naming.names) if class_naming else ""
+        class_names_list = _class_choices_list(class_naming) if class_naming else ""
 
         if attractor_round == "user":
             prompt_tmpl = getattr(cfg, "attractor_query_user_prompt", cfg.attractor_user_prompt) if cfg else "What class is this image, is it {class_names_list}?"
-            user_text = prompt_tmpl.format(class_names_list=class_names_list)
+            user_text = _format_choices_template(
+                prompt_tmpl,
+                class_naming,
+                "Respond with exactly one listed class label and no extra text.",
+            )
             if cfg and cfg.verbose:
                 _log_prompt_exchange(
                     "KV compression attractor",
@@ -920,8 +926,16 @@ class AttentionQueryCompressor(KVCacheCompressor):
         elif attractor_round == "assistant":
             user_prompt_tmpl = getattr(cfg, "attractor_user_prompt", "Now you need to consolidate now.") if cfg else "Now you need to consolidate now."
             asst_prompt_tmpl = getattr(cfg, "attractor_asst_prompt", "Understood, I consolidate {class_names_list}.") if cfg else "Understood, I consolidate {class_names_list}."
-            user_text = user_prompt_tmpl.format(class_names_list=class_names_list)
-            asst_text = asst_prompt_tmpl.format(class_names_list=class_names_list)
+            user_text = _format_choices_template(
+                user_prompt_tmpl,
+                class_naming,
+                "Keep these as the only allowed class labels.",
+            )
+            asst_text = _format_choices_template(
+                asst_prompt_tmpl,
+                class_naming,
+                "Use only one of these listed class labels.",
+            )
             if cfg and cfg.verbose:
                 _log_prompt_exchange(
                     "KV compression attractor",
@@ -1059,6 +1073,7 @@ class EmbedBuilder:
         visual_embeds: Optional[torch.Tensor],  # (1, N_vis, D) or None
         assistant_text: str,
         is_first_turn: bool = True,
+        include_assistant_tail: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, Tuple[int, int]]]:
         """
         Build one complete user->assistant turn embedding.
@@ -1098,7 +1113,8 @@ class EmbedBuilder:
 
         _add("user_to_asst", self.llm.embed_text(self.chat.user_to_asst))
         _add("assistant",    self.llm.embed_text(assistant_text))
-        _add("asst_tail",    self.llm.embed_text(self.chat.asst_tail))
+        if include_assistant_tail:
+            _add("asst_tail", self.llm.embed_text(self.chat.asst_tail))
 
         return torch.cat(parts, dim=1), positions
 
@@ -1216,31 +1232,86 @@ class ClassNaming:
         return [self._id_to_name[i] for i in range(len(self.classes))]
 
 
+def _class_choices_list(class_naming: ClassNaming) -> str:
+    """Return the allowed labels, mapping encoded labels to their class names."""
+    if class_naming.label_mode == "direct":
+        return ", ".join(class_naming.names)
+    return ", ".join(
+        f"{name}: {class_naming.original(index)}"
+        for index, name in enumerate(class_naming.names)
+    )
+
+
 def _format_class_prompt(
     template: str,
     class_naming: ClassNaming,
     class_name: Optional[str] = None,
     include_options: bool = False,
+    verbose: bool = False,
+    context: str = "class prompt",
+    rank_k: int = 1,
+    sample_ranking: bool = False,
+    ranking_instruction: Optional[str] = None,
+    sampled_ranking_instruction: Optional[str] = None,
+    single_ranking_instruction: Optional[str] = None,
 ) -> str:
-    """Format a prompt with optional label-to-class choices."""
-    if include_options:
-        if class_naming.label_mode == "direct":
-            class_names_list = ", ".join(class_naming.names)
-        else:
-            class_names_list = ", ".join(
-                f"{name}: {class_naming.original(i)}"
-                for i, name in enumerate(class_naming.names)
-            )
-    else:
-        class_names_list = ", ".join(class_naming.names)
+    """Format an image query with explicit choices and ranked-answer rules."""
+    if rank_k < 1:
+        raise ValueError("rank_k must be at least 1")
+    class_names_list = (
+        _class_choices_list(class_naming)
+        if include_options else ", ".join(class_naming.names)
+    )
     if include_options:
         if "{class_names_list}" not in template:
             template = f"{template} Options: {{class_names_list}}."
-        if "answer with" not in template.lower():
-            template = f"{template} Answer with exactly one listed label."
-    return template.format(
+    formatted = template.format(
         class_name=class_name or "",
         class_names_list=class_names_list,
+        rank_k=rank_k,
+    )
+    if rank_k == 1:
+        rule_template = single_ranking_instruction or (
+            "Return exactly the single most likely listed label."
+        )
+    elif sample_ranking:
+        rule_template = sampled_ranking_instruction or (
+            "Sample {rank_k} distinct listed labels without replacement and return "
+            "them in sampled order, separated by commas."
+        )
+    else:
+        rule_template = ranking_instruction or (
+            "Return the top {rank_k} distinct listed labels in descending likelihood "
+            "order, separated by commas."
+        )
+    ranking_rule = rule_template.format(rank_k=rank_k)
+    formatted = f"{formatted} {ranking_rule} Use only the listed labels."
+    if verbose:
+        logging.info("Formatted prompt text (%s):\n%s", context, formatted or "<empty>")
+    return formatted
+
+
+def _format_choices_template(
+    template: str,
+    class_naming: ClassNaming,
+    required_constraint: str,
+    rank_k: int = 1,
+    reasoning_max_words: int = DEFAULT_REASONING_MAX_WORDS,
+) -> str:
+    """Format prompt fields and ensure label choices and constraints are present."""
+    if "{class_names_list}" not in template:
+        template = f"{template} Allowed class labels: {{class_names_list}}."
+    if "class_names_list" not in template.lower():
+        template = f"{template} {required_constraint}"
+    elif not any(
+        phrase in template.lower()
+        for phrase in ("only valid labels", "exactly one", "only allowed labels")
+    ):
+        template = f"{template} {required_constraint}"
+    return template.format(
+        class_names_list=_class_choices_list(class_naming),
+        rank_k=rank_k,
+        reasoning_max_words=reasoning_max_words,
     )
 
 
@@ -1274,27 +1345,37 @@ def _log_query_and_extraction(
     query_text: str,
     patch_count: int,
     chat: ChatSegments,
+    is_first_turn: bool,
     answer_mode: str,
     temperature: float,
     scores: Dict[str, float],
-    selected: str,
+    selected: List[str],
 ) -> None:
     """Log the exact image query and how its assistant answer was extracted."""
     logging.info("Runtime image-query trace (%s):", context)
+    prefix = chat.global_prefix if is_first_turn else chat.turn_separator
+    logging.info("  Embed flow: prefix=%r", prefix)
     logging.info("  User content:\n%s", _render_embedded_images(query_text, patch_count))
-    logging.info("  Chat boundary before answer: user_close=%r assistant_open=%r",
-                 chat.user_close, chat.asst_open or chat.user_to_asst)
+    logging.info(
+        "  Chat boundary before answer: user_close=%r assistant_open=%r",
+        chat.user_close,
+        chat.asst_open or chat.user_to_asst,
+    )
     logging.info(
         "  Answer extraction: mode=%s, temperature=%s, candidates=%s",
         answer_mode,
         temperature,
         ", ".join(scores),
     )
-    score_kind = "sequence log-probability" if answer_mode == "full_prob" else "first-token logit"
+    score_kind = (
+        "complete-label sequence log-probability"
+        if answer_mode == "full_prob"
+        else "first-token logit (complete sequence is used automatically on token-prefix collisions)"
+    )
     logging.info("  Candidate %s scores:", score_kind)
     for label, score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
         logging.info("    %-20s %.8g", label, score)
-    logging.info("  Selected assistant answer: %s", selected)
+    logging.info("  Selected assistant ranking: %s", ", ".join(selected))
 
 
 def _log_prompt_catalog(
@@ -1304,6 +1385,11 @@ def _log_prompt_catalog(
     answer_mode: str,
     temperature: float,
     attractor_round: str,
+    patch_count: int,
+    rank_k: int,
+    sample_ranking: bool,
+    reasoning_enabled: bool,
+    reasoning_max_new_tokens: int,
 ) -> None:
     """Log all configured prompt templates and representative rendered turns."""
     if not cfg.verbose:
@@ -1313,10 +1399,37 @@ def _log_prompt_catalog(
         cfg.guess_user_tmpl,
         class_naming,
         include_options=(cfg.include_class_options or answer_mode == "full_prob"),
+        verbose=True,
+        context="startup image-query template",
+        rank_k=rank_k,
+        sample_ranking=sample_ranking,
+        ranking_instruction=cfg.ranking_instruction,
+        sampled_ranking_instruction=cfg.sampled_ranking_instruction,
+        single_ranking_instruction=cfg.single_ranking_instruction,
     )
     sample_label = class_naming.names[0]
-    correct_text = cfg.guess_correct_asst.format(class_name=sample_label)
-    wrong_text = cfg.guess_wrong_asst.format(class_name=sample_label)
+    reasoning_instruction = (
+        cfg.reasoning_prompt.format(max_words=cfg.reasoning_max_words)
+        if reasoning_enabled else ""
+    )
+    feedback_user_correct = cfg.feedback_user_prompt.format(
+        class_name=sample_label,
+        ranked_labels=sample_label,
+        true_rank=1,
+        rank_k=rank_k,
+        rank_feedback=cfg.rank_feedback_top1,
+        reasoning_instruction=reasoning_instruction,
+        max_words=cfg.reasoning_max_words,
+    )
+    feedback_user_wrong = cfg.feedback_user_prompt.format(
+        class_name=sample_label,
+        ranked_labels=f"{class_naming.names[1] if len(class_naming.names) > 1 else sample_label}, {sample_label}",
+        true_rank=2,
+        rank_k=rank_k,
+        rank_feedback=cfg.rank_feedback_in_topk.format(true_rank=2, rank_k=rank_k),
+        reasoning_instruction=reasoning_instruction,
+        max_words=cfg.reasoning_max_words,
+    )
     class_names_list = ", ".join(class_naming.names)
     attractor_query = cfg.attractor_query_user_prompt.format(
         class_names_list=class_names_list
@@ -1333,8 +1446,12 @@ def _log_prompt_catalog(
     logging.info("=" * 78)
     logging.info("Class labels: %s", ", ".join(class_naming.names))
     logging.info("Image insertion format: user text, then one image embedding sequence")
-    logging.info("  %s", _render_embedded_images(query, patch_count=4))
-    logging.info("Answer extraction: mode=%s, temperature=%s", answer_mode, temperature)
+    logging.info("  %s", _render_embedded_images(query, patch_count=patch_count))
+    logging.info("Answer extraction: mode=%s, rank_k=%d, sample=%s, temperature=%s",
+                 answer_mode, rank_k, sample_ranking, temperature)
+    logging.info("AR reasoning: enabled=%s, max_new_tokens=%d, max_words=%d, top_p=%s",
+                 reasoning_enabled, reasoning_max_new_tokens, cfg.reasoning_max_words,
+                 "configured via CLI")
     logging.info("  Candidate labels: %s", ", ".join(class_naming.names))
     logging.info("  At temperature 0, select the maximum candidate score; otherwise sample from candidate scores.")
     logging.info("Chat-template boundaries used by the embed builder:")
@@ -1352,18 +1469,18 @@ def _log_prompt_catalog(
     )
     _log_prompt_exchange(
         "configured image query template (used in teaching and test)",
-        _render_embedded_images(query, patch_count=4),
+        _render_embedded_images(query, patch_count=patch_count),
         "<sampled from candidate labels: " + ", ".join(class_naming.names) + ">",
     )
     _log_prompt_exchange(
-        "configured feedback when sampled answer is correct",
-        cfg.guess_correct_user.format(class_name=sample_label),
-        correct_text,
+        "feedback user round (true label + ranking status)",
+        feedback_user_correct,
+        "<assistant generation starts here>" if reasoning_enabled else cfg.feedback_acknowledgement,
     )
     _log_prompt_exchange(
-        "configured feedback when sampled answer is wrong",
-        cfg.guess_correct_user.format(class_name=sample_label),
-        wrong_text,
+        "feedback user round (true label + ranking status; non-top-1 example)",
+        feedback_user_wrong,
+        "<assistant generation starts here>" if reasoning_enabled else cfg.feedback_acknowledgement,
     )
     _log_prompt_exchange(
         "configured attractor query prompt (user round)",
@@ -1376,14 +1493,25 @@ def _log_prompt_catalog(
         attractor_asst,
     )
     logging.info("Active KV attractor mode: %s", attractor_round)
+    logging.info("Instruction turn: %s", "enabled" if cfg.use_instruction_turn else "disabled")
+    if attractor_round == "turn_tail":
+        logging.info("Separate attractor user/assistant prompts are configured but inactive in turn_tail mode.")
     logging.info("Raw template formats:")
     for template_name, template_value in (
         ("instruction_user_prompt", cfg.instruction_user_prompt),
         ("instruction_asst_prompt", cfg.instruction_asst_prompt),
         ("guess_user_tmpl", cfg.guess_user_tmpl),
-        ("guess_correct_user", cfg.guess_correct_user),
-        ("guess_correct_asst", cfg.guess_correct_asst),
-        ("guess_wrong_asst", cfg.guess_wrong_asst),
+        ("ranking_instruction", cfg.ranking_instruction),
+        ("sampled_ranking_instruction", cfg.sampled_ranking_instruction),
+        ("single_ranking_instruction", cfg.single_ranking_instruction),
+        ("reasoning_prompt", cfg.reasoning_prompt),
+        ("reasoning_max_words", str(cfg.reasoning_max_words)),
+        ("reasoning_min_new_tokens", str(cfg.reasoning_min_new_tokens)),
+        ("feedback_user_prompt", cfg.feedback_user_prompt),
+        ("feedback_acknowledgement", cfg.feedback_acknowledgement),
+        ("rank_feedback_top1", cfg.rank_feedback_top1),
+        ("rank_feedback_in_topk", cfg.rank_feedback_in_topk),
+        ("rank_feedback_missed", cfg.rank_feedback_missed),
         ("attractor_query_user_prompt", cfg.attractor_query_user_prompt),
         ("attractor_user_prompt", cfg.attractor_user_prompt),
         ("attractor_asst_prompt", cfg.attractor_asst_prompt),
@@ -1401,7 +1529,9 @@ class PromptConfig:
     """
     Text templates for each part of the conversation.
 
-    Template variables: {class_name}, {class_names_list}
+    Template variables: {class_name}, {class_names_list}, {rank_k}, {ranked_labels},
+    {true_rank}, {rank_feedback}, {reasoning_instruction}, {reasoning_max_words},
+    {max_words}.
     """
     # First-round instruction / system setup turn
     instruction_user_prompt: str = (
@@ -1410,8 +1540,16 @@ class PromptConfig:
         "SGD classification training, assisted by a KV cache compression algorithm.\n"
         "Because earlier KV cache entries are dynamically removed, your self-attention at recent "
         "timesteps may not attend back to all earlier inputs.\n\n"
-        "You will see one image's patch vectors at a time and predict its class. "
-        "The user will then reveal the correct class. Learn from that feedback.\n\n"
+        "You will see one image's patch vectors at a time. The valid class labels "
+        "are {class_names_list}. For each image, return up to {rank_k} distinct "
+        "labels, separated by commas (for example: cat, dog, frog), following "
+        "the ranking rule specified for this experiment. Use only the listed "
+        "labels; do not add explanations to the ranked answer. The user will "
+        "reveal the correct class; use that "
+        "feedback to learn. After the assistant gives correctness feedback, if "
+        "reasoning mode is enabled, continue autoregressively with one concise "
+        "visual explanation using at most {reasoning_max_words} words. Do not "
+        "repeat the ranked labels or invent visual details.\n\n"
         "At the end of training, there will be test images unseen during in-context learning."
     )
     instruction_asst_prompt: str = "Understood."
@@ -1420,16 +1558,53 @@ class PromptConfig:
     # Attractor query settings (for AttentionQueryCompressor)
     attractor_round: str = "assistant"   # 'assistant' (user Q + forced asst A), 'user' (user Q only), or 'turn_tail'
     attractor_temporary: bool = False    # If True, query prefill is transient/discarded; if False, appended to KV
-    attractor_user_prompt: str = "Now you need to consolidate now."
-    attractor_asst_prompt: str = "Understood, I consolidate {class_names_list}."
-    attractor_query_user_prompt: str = "What class is this image, is it {class_names_list}?"
+    attractor_user_prompt: str = (
+        "Consolidate prior examples for these classes: {class_names_list}. "
+        "Keep these as the only allowed class labels."
+    )
+    attractor_asst_prompt: str = (
+        "Understood. I will consolidate using only these class labels: {class_names_list}."
+    )
+    attractor_query_user_prompt: str = (
+        "What class is this image? Choose exactly one label from: {class_names_list}. "
+        "Answer with only that label."
+    )
 
     # Per-image teaching and test query
-    guess_user_tmpl: str      = "What class is this image?"
-    guess_correct_user: str   = "{class_name}"
-    guess_correct_asst: str   = "I was correct, it is {class_name}"
-    guess_wrong_asst: str     = "I was wrong, should be {class_name}"
-
+    guess_user_tmpl: str = "What class is this image?"
+    ranking_instruction: str = (
+        "Return the top {rank_k} distinct listed labels in descending likelihood "
+        "order, separated by commas."
+    )
+    sampled_ranking_instruction: str = (
+        "Sample {rank_k} distinct listed labels without replacement and return "
+        "them in sampled order, separated by commas."
+    )
+    single_ranking_instruction: str = (
+        "Return exactly the single most likely listed label."
+    )
+    reasoning_prompt: str = (
+        "As the assistant, briefly explain the visual evidence for the true class "
+        "and the ranking outcome in at most {max_words} words. Do not repeat labels "
+        "or invent visual details."
+    )
+    reasoning_max_words: int = DEFAULT_REASONING_MAX_WORDS
+    reasoning_min_new_tokens: int = 1
+    # Feedback is supplied in the USER round. The model then answers in a fresh
+    # ASSISTANT round; this avoids placing an instruction such as "Explain why"
+    # inside a forced assistant prefix and then trying to continue it.
+    rank_feedback_top1: str = "The true class is ranked first."
+    rank_feedback_in_topk: str = (
+        "The true class is ranked {true_rank} of {rank_k}."
+    )
+    rank_feedback_missed: str = (
+        "The true class is outside the top {rank_k}."
+    )
+    feedback_user_prompt: str = (
+        "Ground-truth label: {class_name}. Ranked prediction: {ranked_labels}. "
+        "{rank_feedback} {reasoning_instruction}"
+    )
+    feedback_acknowledgement: str = "Feedback received."
     include_class_options: bool = False
     verbose: bool = False
 
@@ -1485,19 +1660,42 @@ def prefill_instruction(
     builder: EmbedBuilder,
     past_kv,
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
+    class_naming: Optional[ClassNaming] = None,
+    rank_k: int = 3,
+    reasoning_enabled: bool = False,
+    sample_ranking: bool = False,
 ) -> Tuple[object, Dict]:
     """
     Prefill the first-round instruction turn (user instruction + assistant response).
     This establishes task context before any image training data is ingested.
     """
+    user_text = cfg.instruction_user_prompt
+    if class_naming is not None:
+        user_text = _format_choices_template(
+            user_text,
+            class_naming,
+            (
+                (
+                    cfg.sampled_ranking_instruction.format(rank_k=rank_k)
+                    if sample_ranking else
+                    cfg.ranking_instruction.format(rank_k=rank_k)
+                ) + " Use only listed labels and include no explanation in the ranked answer."
+            ),
+            rank_k=rank_k,
+            reasoning_max_words=cfg.reasoning_max_words,
+        )
+        if reasoning_enabled:
+            user_text += " After feedback: " + cfg.reasoning_prompt.format(
+                max_words=cfg.reasoning_max_words
+            )
     if cfg.verbose:
         _log_prompt_exchange(
             "instruction",
-            cfg.instruction_user_prompt,
+            user_text,
             cfg.instruction_asst_prompt,
         )
     turn_emb, positions = builder.build_teaching_turn(
-        user_text=cfg.instruction_user_prompt,
+        user_text=user_text,
         visual_embeds=None,
         assistant_text=cfg.instruction_asst_prompt,
         is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
@@ -1523,81 +1721,174 @@ def teach_guess_correct(
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     answer_mode: str = "first_token",
     temperature: float = 0.0,
+    rank_k: int = 3,
+    sample_ranking: bool = False,
+    reasoning_enabled: bool = False,
+    reasoning_max_new_tokens: int = 32,
+    reasoning_temperature: float = 0.7,
+    reasoning_top_p: float = 0.9,
     guess_prob_gt: float = 0.0,
     guess_prob_random: float = 0.0,
-) -> Tuple[object, bool, str]:
+) -> Tuple[object, bool, List[str]]:
     """
     'guess-correct' mode for a single image.
 
     Dialogue (all within one accumulated KV):
-        [turn 1] user: <visual embed>
-                 assistant: <model's guess>
-        [turn 2] user: <true class name>
-                 assistant: "correct, <class>" or "wrong, it is <class>"
+        [turn 1] user: <image query + visual embeds>
+             assistant: <ranked model labels>
+        [turn 2] user: <true label + ranking status + explanation request>
+             assistant: autoregressively generated explanation (when enabled).
+
+    In reasoning mode, turn 2 ends at the assistant-open chat tag. No assistant
+    text is force-prefilled before decoding.
 
     Guess mode flags:
         guess_prob_gt: legacy probability of replacing the sampled prediction with ground truth
         guess_prob_random: legacy probability of replacing the sampled prediction with a random label
 
     Returns:
-        (past_kv, was_correct, guessed_class_name)
+        (past_kv, top1_was_correct, ranked_class_names)
     """
-    guessed_name, _, past_kv_q = predict_image(
+    ranked_names, _, past_kv_q = predict_image(
         llm, builder, img_tok, image, class_naming, past_kv,
         cfg=cfg, answer_mode=answer_mode, temperature=temperature,
+        rank_k=rank_k, sample_ranking=sample_ranking,
         keep_query_cache=True,
         prompt_context="teaching guess-correct / prediction",
     )
 
     # Legacy experiment overrides; both are disabled by default.
     if guess_prob_gt > 0.0 and random.random() < guess_prob_gt:
-        guessed_name = true_class_name
+        ranked_names = [true_class_name] + [
+            name for name in ranked_names if name != true_class_name
+        ][:max(0, rank_k - 1)]
     elif guess_prob_random > 0.0 and random.random() < guess_prob_random:
-        guessed_name = random.choice(class_naming.names)
+        replacement = random.choice(class_naming.names)
+        ranked_names = [replacement] + [
+            name for name in ranked_names if name != replacement
+        ][:max(0, rank_k - 1)]
 
     if cfg.verbose and (guess_prob_gt > 0.0 or guess_prob_random > 0.0):
         query_text = _format_class_prompt(
             cfg.guess_user_tmpl,
             class_naming,
             include_options=cfg.include_class_options,
+            verbose=cfg.verbose,
+            context="legacy teaching override query",
+            rank_k=rank_k,
+            ranking_instruction=cfg.ranking_instruction,
+            sampled_ranking_instruction=cfg.sampled_ranking_instruction,
+            single_ranking_instruction=cfg.single_ranking_instruction,
         )
         _log_prompt_exchange(
             "legacy teaching guess override",
             _render_embedded_images(query_text, patch_count=img_tok.num_patches),
-            guessed_name,
+            ", ".join(ranked_names),
         )
 
     # Append guessed_name as assistant response
     device = llm.device
     dtype = llm.model_dtype
     pred_emb = llm.embed_text(
-        " " + guessed_name + builder.chat.asst_tail,
+        " " + ", ".join(ranked_names) + builder.chat.asst_tail,
         add_special_tokens=False,
     )
     pred_emb = pred_emb.to(device=device, dtype=dtype)
     _, past_kv_q, _ = llm.prefill(pred_emb, past_kv=past_kv_q, use_cache=True)
 
-    # -- Turn 2: user reveals true label, assistant acknowledges --
-    was_correct = (guessed_name == true_class_name)
-    if was_correct:
-        asst_feedback = cfg.guess_correct_asst.format(class_name=true_class_name)
-    else:
-        asst_feedback = cfg.guess_wrong_asst.format(class_name=true_class_name)
-
-    if cfg.verbose:
-        _log_prompt_exchange(
-            "teaching guess-correct / feedback",
-            cfg.guess_correct_user.format(class_name=true_class_name),
-            asst_feedback,
-        )
-
-    fb_emb, _ = builder.build_teaching_turn(
-        user_text=cfg.guess_correct_user.format(class_name=true_class_name),
-        visual_embeds=None,
-        assistant_text=asst_feedback,
-        is_first_turn=False,
+    # -- Turn 2: user reveals the true label and asks for feedback --
+    # The explanation request belongs to the USER message. The constructed turn
+    # ends at the assistant-open tag, so autoregressive decoding starts as an
+    # actual assistant response rather than continuing a forced assistant text.
+    true_rank = ranked_names.index(true_class_name) + 1 if true_class_name in ranked_names else None
+    was_correct = ranked_names[0] == true_class_name
+    rank_feedback = (
+        cfg.rank_feedback_top1
+        if true_rank == 1 else
+        cfg.rank_feedback_in_topk.format(true_rank=true_rank, rank_k=len(ranked_names))
+        if true_rank is not None else
+        cfg.rank_feedback_missed.format(rank_k=len(ranked_names), true_rank="outside top-k")
     )
-    _, past_kv_q, _ = llm.prefill(fb_emb, past_kv=past_kv_q, use_cache=True)
+    reasoning_instruction = (
+        cfg.reasoning_prompt.format(max_words=cfg.reasoning_max_words)
+        if reasoning_enabled else ""
+    )
+    feedback_user_text = cfg.feedback_user_prompt.format(
+        class_name=true_class_name,
+        ranked_labels=", ".join(ranked_names),
+        true_rank=true_rank if true_rank is not None else "outside top-k",
+        rank_k=len(ranked_names),
+        rank_feedback=rank_feedback,
+        reasoning_instruction=reasoning_instruction,
+        max_words=cfg.reasoning_max_words,
+    ).strip()
+
+    if reasoning_enabled:
+        # User round -> assistant-open. Do not prefill any assistant answer text.
+        fb_emb, _ = builder.build_query_turn(
+            user_text=feedback_user_text,
+            visual_embeds=None,
+            is_first_turn=False,
+        )
+        feedback_logits, past_kv_q, _ = llm.prefill(
+            fb_emb, past_kv=past_kv_q, use_cache=True
+        )
+        next_logits = feedback_logits[0, -1]
+        if cfg.verbose:
+            logging.info("Feedback user round: %s", feedback_user_text)
+            logging.info(
+                "Feedback assistant-generation boundary: user_close=%r, assistant_open=%r",
+                builder.chat.user_close,
+                builder.chat.asst_open or builder.chat.user_to_asst,
+            )
+            top_values, top_ids = torch.topk(next_logits.float(), k=min(8, next_logits.numel()))
+            top_tokens = [
+                (int(token_id), repr(llm.tokenizer.decode([int(token_id)], skip_special_tokens=False)), float(value))
+                for token_id, value in zip(top_ids.tolist(), top_values.tolist())
+            ]
+            logging.info("Next-token candidates at assistant-open: %s", top_tokens)
+
+        reasoning_text, past_kv_q = autoregressive_decode(
+            llm,
+            past_kv_q,
+            next_logits,
+            max_new_tokens=reasoning_max_new_tokens,
+            temperature=reasoning_temperature,
+            top_p=reasoning_top_p,
+            max_words=cfg.reasoning_max_words,
+            min_new_tokens=cfg.reasoning_min_new_tokens,
+        )
+        # Close the assistant turn only AFTER autoregressive generation.
+        tail_emb = llm.embed_text(builder.chat.asst_tail, add_special_tokens=False)
+        if tail_emb.shape[1] > 0:
+            _, past_kv_q, _ = llm.prefill(
+                tail_emb, past_kv=past_kv_q, use_cache=True
+            )
+        if cfg.verbose:
+            logging.info(
+                "Generated assistant reasoning (%d-token budget, %d-word budget): %s",
+                reasoning_max_new_tokens,
+                cfg.reasoning_max_words,
+                reasoning_text or "<empty>",
+            )
+    else:
+        # Without AR reasoning, retain a complete user->assistant feedback turn.
+        fb_emb, _ = builder.build_teaching_turn(
+            user_text=feedback_user_text,
+            visual_embeds=None,
+            assistant_text=cfg.feedback_acknowledgement,
+            is_first_turn=False,
+            include_assistant_tail=True,
+        )
+        _, past_kv_q, _ = llm.prefill(
+            fb_emb, past_kv=past_kv_q, use_cache=True
+        )
+        if cfg.verbose:
+            _log_prompt_exchange(
+                "teaching feedback (reasoning disabled)",
+                feedback_user_text,
+                cfg.feedback_acknowledgement,
+            )
 
     if compressor is not None and not isinstance(compressor, NoopCompressor):
         past_kv_q = compress_kv(
@@ -1605,7 +1896,7 @@ def teach_guess_correct(
             data_range=None, cfg=cfg, in_turn_attentions=None
         )
 
-    return past_kv_q, was_correct, guessed_name
+    return past_kv_q, was_correct, ranked_names
 
 
 # ---------------------------------------------------------------------------
@@ -1623,9 +1914,11 @@ def predict_image(
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     answer_mode: str = "first_token",
     temperature: float = 0.0,
+    rank_k: int = 3,
+    sample_ranking: bool = False,
     keep_query_cache: bool = False,
     prompt_context: str = "test/evaluation",
-) -> Tuple[str, Dict[str, float], object]:
+) -> Tuple[List[str], Dict[str, float], object]:
     """
     Build the shared image query, then sample a class from its next-token scores.
     Teaching retains the query cache to append the answer and feedback; evaluation
@@ -1635,6 +1928,9 @@ def predict_image(
         raise ValueError(f"Unknown answer_mode: {answer_mode}")
     if temperature < 0:
         raise ValueError("temperature must be non-negative")
+    if rank_k < 1:
+        raise ValueError("rank_k must be at least 1")
+    rank_k = min(rank_k, len(class_naming.names))
     device = llm.device
     dtype  = llm.model_dtype
 
@@ -1642,12 +1938,20 @@ def predict_image(
 
     query_text = _format_class_prompt(
         cfg.guess_user_tmpl, class_naming,
-        include_options=cfg.include_class_options or answer_mode == "full_prob",
+        include_options=True,
+        verbose=cfg.verbose,
+        context=prompt_context,
+        rank_k=min(rank_k, len(class_naming.names)),
+        sample_ranking=sample_ranking,
+        ranking_instruction=cfg.ranking_instruction,
+        sampled_ranking_instruction=cfg.sampled_ranking_instruction,
+        single_ranking_instruction=cfg.single_ranking_instruction,
     )
+    is_first_turn = past_kv is None or kv_seq_len(past_kv) == 0
     q_emb, _ = builder.build_query_turn(
         user_text=query_text,
         visual_embeds=patches,
-        is_first_turn=(past_kv is None or kv_seq_len(past_kv) == 0),
+        is_first_turn=is_first_turn,
     )
 
     label_tokens = [_class_token_ids(llm, name) for name in class_naming.names]
@@ -1664,10 +1968,12 @@ def predict_image(
         q_emb, past_kv=query_context, use_cache=retain_query_cache
     )
     next_logits = logits[0, -1, :]
-    predicted, scores = sample_class(
+    ranked_names, scores = sample_class(
         llm, next_logits, class_naming, answer_mode=answer_mode,
         temperature=temperature,
         ctx_kv=query_kv,
+        rank_k=rank_k,
+        sample_ranking=sample_ranking,
     )
     if cfg.verbose:
         _log_query_and_extraction(
@@ -1675,12 +1981,13 @@ def predict_image(
             query_text,
             patch_count=patches.shape[1],
             chat=builder.chat,
+            is_first_turn=is_first_turn,
             answer_mode=answer_mode,
             temperature=temperature,
             scores=scores,
-            selected=predicted,
+            selected=ranked_names,
         )
-    return predicted, scores, query_kv
+    return ranked_names, scores, query_kv
 
 
 def classify_image(
@@ -1693,14 +2000,17 @@ def classify_image(
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     answer_mode: str = "first_token",
     temperature: float = 0.0,
-) -> Tuple[str, Dict[str, float]]:
+    rank_k: int = 3,
+    sample_ranking: bool = False,
+) -> Tuple[List[str], Dict[str, float]]:
     """Evaluation wrapper around the same predictor used during teaching."""
-    predicted, scores, _ = predict_image(
+    ranked_names, scores, _ = predict_image(
         llm, builder, img_tok, image, class_naming, past_kv,
         cfg=cfg, answer_mode=answer_mode, temperature=temperature,
+        rank_k=rank_k, sample_ranking=sample_ranking,
         keep_query_cache=False,
     )
-    return predicted, scores
+    return ranked_names, scores
 
 
 def _class_token_ids(llm: LLMWrapper, name: str) -> List[int]:
@@ -1720,39 +2030,53 @@ def sample_class(
     answer_mode: str = "first_token",
     temperature: float = 0.0,
     ctx_kv=None,
-) -> Tuple[str, Dict[str, float]]:
-    """Sample a candidate label; temperature 0 selects the greedy maximum."""
+    rank_k: int = 3,
+    sample_ranking: bool = False,
+) -> Tuple[List[str], Dict[str, float]]:
+    """Rank up to ``rank_k`` candidates; optionally sample a distinct ordering."""
     if answer_mode not in ("first_token", "full_prob"):
         raise ValueError(f"Unknown answer_mode: {answer_mode}")
     if temperature < 0:
         raise ValueError("temperature must be non-negative")
+    if rank_k < 1:
+        raise ValueError("rank_k must be at least 1")
     token_ids = [_class_token_ids(llm, name) for name in class_naming.names]
     first_ids = [ids[0] for ids in token_ids]
     if answer_mode == "full_prob" or len(set(first_ids)) != len(first_ids):
         if ctx_kv is None:
             raise ValueError("Full-label sampling requires the query KV cache")
-        scores = {
-            name: _sequence_log_prob(llm, name, ctx_kv, first_logits=logits)
+        ranking_logits = torch.tensor([
+            _sequence_log_prob(llm, name, ctx_kv, first_logits=logits)
             for name in class_naming.names
-        }
+        ], device=logits.device, dtype=torch.float32)
     else:
-        scores = {
-            name: logits[token_sequence[0]].item()
-            for name, token_sequence in zip(class_naming.names, token_ids)
-        }
+        ranking_logits = torch.log_softmax(logits.float(), dim=-1)[
+            torch.tensor(first_ids, device=logits.device)
+        ]
 
-    if temperature == 0.0:
-        selected = max(scores, key=scores.get)
+    probabilities = torch.softmax(ranking_logits, dim=0)
+    scores = {
+        name: float(probability)
+        for name, probability in zip(class_naming.names, probabilities.tolist())
+    }
+    candidate_count = min(rank_k, len(class_naming.names))
+
+    if sample_ranking and temperature > 0.0:
+        sample_weights = torch.softmax(ranking_logits / temperature, dim=0)
+        selected_indices = torch.multinomial(
+            sample_weights,
+            num_samples=candidate_count,
+            replacement=False,
+        ).tolist()
+    elif sample_ranking and temperature == 0.0:
+        # Temperature zero is deterministic greedy ordering, even if sampling
+        # is enabled, matching conventional decoding semantics.
+        selected_indices = torch.argsort(ranking_logits, descending=True)[:candidate_count].tolist()
     else:
-        label_scores = torch.tensor(
-            [scores[name] for name in class_naming.names],
-            device=logits.device,
-            dtype=torch.float32,
-        )
-        probabilities = torch.softmax(label_scores / temperature, dim=0)
-        selected_index = torch.multinomial(probabilities, num_samples=1).item()
-        selected = class_naming.names[selected_index]
-    return selected, scores
+        selected_indices = torch.argsort(ranking_logits, descending=True)[:candidate_count].tolist()
+
+    ranked_labels = [class_naming.names[index] for index in selected_indices]
+    return ranked_labels, scores
 
 
 @torch.no_grad()
@@ -1784,6 +2108,84 @@ def _sequence_log_prob(
 
 
 @torch.no_grad()
+def autoregressive_decode(
+    llm: LLMWrapper,
+    past_kv,
+    next_logits: torch.Tensor,
+    max_new_tokens: int = 24,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    max_words: int = 10,
+    min_new_tokens: int = 1,
+) -> Tuple[str, object]:
+    """Decode a bounded assistant continuation using temperature and nucleus sampling."""
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative")
+    if temperature < 0:
+        raise ValueError("reasoning temperature must be non-negative")
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be in (0, 1]")
+    if max_words < 1:
+        raise ValueError("max_words must be at least 1")
+    if min_new_tokens < 0 or min_new_tokens > max_new_tokens:
+        raise ValueError("min_new_tokens must be between 0 and max_new_tokens")
+
+    generated: List[int] = []
+    current_logits = next_logits.float().clone()
+    current_kv = past_kv
+    eos_id = llm.tokenizer.eos_token_id
+
+    for _ in range(max_new_tokens):
+        step_logits = current_logits.clone()
+        # Some chat-tuned models emit EOS immediately after an assistant-open
+        # prompt. Do not allow that until the configured minimum text budget has
+        # been reached; otherwise reasoning silently becomes an empty string.
+        if eos_id is not None and len(generated) < min_new_tokens:
+            step_logits[int(eos_id)] = -float("inf")
+        if temperature == 0.0:
+            next_id = int(torch.argmax(step_logits).item())
+        else:
+            scaled = step_logits / temperature
+            probabilities = torch.softmax(scaled, dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            remove = cumulative - sorted_probs >= top_p
+            sorted_probs[remove] = 0
+            filtered = torch.zeros_like(probabilities).scatter(
+                0, sorted_indices, sorted_probs
+            )
+            filtered = filtered / filtered.sum()
+            next_id = int(torch.multinomial(filtered, num_samples=1).item())
+
+        if eos_id is not None and next_id == eos_id:
+            break
+        # Check the candidate before committing it to the KV cache so even a
+        # tokenizer token containing multiple whitespace-delimited words cannot
+        # push the continuation beyond max_words.
+        candidate_ids = generated + [next_id]
+        candidate_text = llm.tokenizer.decode(candidate_ids, skip_special_tokens=True)
+        if len(candidate_text.split()) > max_words:
+            break
+        generated.append(next_id)
+        token_embeds = llm.model.get_input_embeddings()(
+            torch.tensor([[next_id]], device=llm.device)
+        ).to(llm.model_dtype)
+        logits, current_kv, _ = llm.prefill(
+            token_embeds, past_kv=current_kv, use_cache=True
+        )
+        current_logits = logits[0, -1].float()
+        # Enforce the requested short-reasoning budget as well as max_new_tokens.
+        if len(candidate_text.split()) >= max_words:
+            break
+
+    decoded_text = llm.tokenizer.decode(generated, skip_special_tokens=True)
+    decoded_words = decoded_text.split()
+    if len(decoded_words) > max_words:
+        decoded_text = " ".join(decoded_words[:max_words])
+    return decoded_text, current_kv
+
+
+@torch.no_grad()
 def evaluate_dataset(
     llm: LLMWrapper,
     builder: EmbedBuilder,
@@ -1794,6 +2196,8 @@ def evaluate_dataset(
     cfg: PromptConfig = DEFAULT_PROMPT_CFG,
     answer_mode: str = "first_token",
     temperature: float = 0.0,
+    rank_k: int = 3,
+    sample_ranking: bool = False,
     verbose: bool = False,
     desc: str = "Evaluating",
 ) -> Tuple[float, List[str], List[str]]:
@@ -1825,6 +2229,7 @@ def evaluate_dataset(
     all_true: List[str] = []
     all_pred: List[str] = []
     correct = 0
+    topk_correct = 0
     count = 0
 
     pbar = tqdm(total=total_imgs, desc=desc, leave=False, dynamic_ncols=True)
@@ -1840,21 +2245,28 @@ def evaluate_dataset(
                     cfg=cfg,
                     answer_mode=answer_mode,
                     temperature=temperature,
+                    rank_k=rank_k,
+                    sample_ranking=sample_ranking,
                 )
+                ranked_names = pred_name
+                pred_name = ranked_names[0]
             except Exception as e:
                 logging.error(f"Error classifying {cls_name} img {img_idx}: {e}")
-                pred_name = class_naming.names[0]
+                ranked_names = [class_naming.names[0]]
+                pred_name = ranked_names[0]
                 scores = {}
 
             is_ok = (pred_name == cls_name)
             correct += int(is_ok)
+            topk_correct += int(cls_name in ranked_names)
             count += 1
             all_true.append(cls_name)
             all_pred.append(pred_name)
 
             pbar.update(1)
             pbar.set_postfix({
-                "acc": f"{100.0 * correct / count:.1f}%",
+                "top1": f"{100.0 * correct / count:.1f}%",
+                f"top{rank_k}": f"{100.0 * topk_correct / count:.1f}%",
                 "corr": f"{correct}/{count}",
             })
 
@@ -1863,7 +2275,7 @@ def evaluate_dataset(
                 pred_disp = class_naming.display_name(pred_name)
                 logging.info(
                     f"  [{count:4d}] true={true_disp:20s} pred={pred_disp:20s} "
-                    f"{'✓' if is_ok else '✗'}"
+                    f"ranked={', '.join(ranked_names)} {'✓' if is_ok else '✗'}"
                 )
                 if scores:
                     top = sorted(scores.items(), key=lambda x: -x[1])[:5]
@@ -1875,6 +2287,11 @@ def evaluate_dataset(
 
     pbar.close()
     accuracy = 100.0 * correct / total_imgs if total_imgs > 0 else 0.0
+    topk_accuracy = 100.0 * topk_correct / total_imgs if total_imgs > 0 else 0.0
+    logging.info(
+        "%s accuracy: top-1=%.2f%%, top-%d=%.2f%%",
+        desc, accuracy, rank_k, topk_accuracy,
+    )
     return accuracy, all_true, all_pred
 
 
@@ -2146,8 +2563,44 @@ def parse_args():
                    help="Balance the total train/test subset across classes (default: enabled)")
     p.add_argument("--teaching-epochs", type=int, default=2,
                    help="Number of teaching passes over training data")
-    p.add_argument("--temperature", type=float, default=0.0,
-                   help="Class sampling temperature for both teaching and evaluation (0=greedy argmax)")
+    p.add_argument("--temperature", type=float, default=1.0,
+                   help="Class-ranking sampling temperature (used only with --sample-ranking; default: 1.0)")
+    p.add_argument("--rank-k", type=int, default=3,
+                   help="Number of distinct ranked class candidates to return")
+    p.add_argument("--sample-ranking", action=argparse.BooleanOptionalAction, default=False,
+                   help="Sample distinct ranked classes without replacement instead of deterministic top-k (default: disabled)")
+    p.add_argument("--reasoning", action=argparse.BooleanOptionalAction, default=False,
+                   help="After each teaching feedback prefill, autoregressively generate a short visual explanation (default: disabled)")
+    p.add_argument("--reasoning-max-new-tokens", type=int, default=DEFAULT_REASONING_MAX_WORDS,
+                   help="Maximum autoregressively generated reasoning tokens (also limited by --reasoning-max-words)")
+    p.add_argument("--reasoning-temperature", type=float, default=0.7,
+                   help="Reasoning generation temperature (default: 0.7)")
+    p.add_argument("--reasoning-top-p", type=float, default=0.9,
+                   help="Nucleus sampling top-p for reasoning generation (default: 0.9)")
+    p.add_argument("--reasoning-max-words", type=int, default=DEFAULT_REASONING_MAX_WORDS,
+                   help=f"Maximum words in the generated reasoning continuation (default: {DEFAULT_REASONING_MAX_WORDS})")
+    p.add_argument("--reasoning-min-new-tokens", type=int, default=1,
+                   help="Minimum generated tokens before EOS is allowed (default: 1; prevents immediate empty EOS)")
+    p.add_argument("--query-prompt", type=str, default=None,
+                   help="Override the per-image query prompt (supports {class_names_list} and {rank_k})")
+    p.add_argument("--reasoning-prompt", type=str, default=None,
+                   help="Override the reasoning instruction (supports {max_words})")
+    p.add_argument("--feedback-user-prompt", type=str, default=None,
+                   help="Override the feedback USER-turn template (supports {class_name}, {ranked_labels}, {rank_feedback}, {reasoning_instruction}, {true_rank}, {rank_k}, {max_words})")
+    p.add_argument("--feedback-acknowledgement", type=str, default=None,
+                   help="Override the fixed assistant acknowledgement when reasoning is disabled")
+    p.add_argument("--ranking-instruction", type=str, default=None,
+                   help="Override deterministic ranking instruction (supports {rank_k})")
+    p.add_argument("--sampled-ranking-instruction", type=str, default=None,
+                   help="Override sampled-ranking instruction (supports {rank_k})")
+    p.add_argument("--single-ranking-instruction", type=str, default=None,
+                   help="Override the single-label ranking instruction")
+    p.add_argument("--rank-feedback-top1", type=str, default=None,
+                   help="Override feedback text when the true class is top-ranked")
+    p.add_argument("--rank-feedback-in-topk", type=str, default=None,
+                   help="Override feedback text when the true class is in top-k but not first (supports {true_rank}, {rank_k})")
+    p.add_argument("--rank-feedback-missed", type=str, default=None,
+                   help="Override feedback text when the true class is outside top-k (supports {rank_k})")
     p.add_argument("--answer-mode", choices=["first_token", "full_prob"],
                    default="first_token",
                    help="Score candidate labels by first token or complete token sequence")
@@ -2208,6 +2661,20 @@ def parse_args():
         _validate_subset_spec(args.train_eval_samples, "--train-eval-samples")
     if args.temperature < 0:
         p.error("--temperature must be non-negative")
+    if args.rank_k < 1:
+        p.error("--rank-k must be at least 1")
+    if args.reasoning_max_new_tokens < 0:
+        p.error("--reasoning-max-new-tokens must be non-negative")
+    if args.reasoning and args.reasoning_max_new_tokens < 1:
+        p.error("--reasoning-max-new-tokens must be at least 1 when --reasoning is enabled")
+    if args.reasoning_max_words < 1:
+        p.error("--reasoning-max-words must be at least 1")
+    if args.reasoning_min_new_tokens < 0 or args.reasoning_min_new_tokens > args.reasoning_max_new_tokens:
+        p.error("--reasoning-min-new-tokens must be between 0 and --reasoning-max-new-tokens")
+    if args.reasoning_temperature < 0:
+        p.error("--reasoning-temperature must be non-negative")
+    if not 0.0 < args.reasoning_top_p <= 1.0:
+        p.error("--reasoning-top-p must be in (0, 1]")
     if not 0.0 <= args.guess_prob_gt <= 1.0:
         p.error("--guess-prob-gt must be between 0 and 1")
     if not 0.0 <= args.guess_prob_random <= 1.0:
@@ -2425,6 +2892,28 @@ def main():
         args.include_class_options or args.answer_mode == "full_prob"
     )
     prompt_cfg.verbose = args.verbose
+    prompt_cfg.reasoning_max_words = args.reasoning_max_words
+    prompt_cfg.reasoning_min_new_tokens = args.reasoning_min_new_tokens
+    if args.query_prompt is not None:
+        prompt_cfg.guess_user_tmpl = args.query_prompt
+    if args.reasoning_prompt is not None:
+        prompt_cfg.reasoning_prompt = args.reasoning_prompt
+    if args.feedback_user_prompt is not None:
+        prompt_cfg.feedback_user_prompt = args.feedback_user_prompt
+    if args.feedback_acknowledgement is not None:
+        prompt_cfg.feedback_acknowledgement = args.feedback_acknowledgement
+    if args.ranking_instruction is not None:
+        prompt_cfg.ranking_instruction = args.ranking_instruction
+    if args.sampled_ranking_instruction is not None:
+        prompt_cfg.sampled_ranking_instruction = args.sampled_ranking_instruction
+    if args.single_ranking_instruction is not None:
+        prompt_cfg.single_ranking_instruction = args.single_ranking_instruction
+    if args.rank_feedback_top1 is not None:
+        prompt_cfg.rank_feedback_top1 = args.rank_feedback_top1
+    if args.rank_feedback_in_topk is not None:
+        prompt_cfg.rank_feedback_in_topk = args.rank_feedback_in_topk
+    if args.rank_feedback_missed is not None:
+        prompt_cfg.rank_feedback_missed = args.rank_feedback_missed
     if args.disable_instruction:
         prompt_cfg.use_instruction_turn = False
     prompt_cfg.attractor_round = args.attractor_round
@@ -2442,11 +2931,22 @@ def main():
         answer_mode=args.answer_mode,
         temperature=args.temperature,
         attractor_round=args.attractor_round,
+        patch_count=img_tok.num_patches,
+        rank_k=min(args.rank_k, len(class_naming.names)),
+        sample_ranking=args.sample_ranking,
+        reasoning_enabled=args.reasoning,
+        reasoning_max_new_tokens=args.reasoning_max_new_tokens,
     )
 
     if prompt_cfg.use_instruction_turn and prompt_cfg.instruction_user_prompt:
         logging.info("Prefilling first-round instruction prompt...")
-        past_kv, info = prefill_instruction(llm, builder, past_kv, cfg=prompt_cfg)
+        past_kv, info = prefill_instruction(
+            llm, builder, past_kv, cfg=prompt_cfg,
+            class_naming=class_naming,
+            rank_k=min(args.rank_k, len(class_naming.names)),
+            reasoning_enabled=args.reasoning,
+            sample_ranking=args.sample_ranking,
+        )
         logging.info(f"  -> Instruction prefilled (+{info['tokens_added']} tokens), "
                      f"cache now: {kv_seq_len(past_kv)} tokens")
 
@@ -2479,6 +2979,12 @@ def main():
                 past_kv, compressor=compressor, cfg=prompt_cfg,
                 answer_mode=args.answer_mode,
                 temperature=args.temperature,
+                rank_k=min(args.rank_k, len(class_naming.names)),
+                sample_ranking=args.sample_ranking,
+                reasoning_enabled=args.reasoning,
+                reasoning_max_new_tokens=args.reasoning_max_new_tokens,
+                reasoning_temperature=args.reasoning_temperature,
+                reasoning_top_p=args.reasoning_top_p,
                 guess_prob_gt=args.guess_prob_gt,
                 guess_prob_random=args.guess_prob_random,
             )
@@ -2495,7 +3001,7 @@ def main():
                     index + 1,
                     len(training_pairs),
                     class_naming.display_name(true_name),
-                    class_naming.display_name(predicted),
+                    ", ".join(class_naming.display_name(name) for name in predicted),
                     "✓" if was_correct else "✗",
                     acc,
                     kv_seq_len(past_kv),
@@ -2523,6 +3029,8 @@ def main():
                     class_naming=class_naming, past_kv=past_kv,
                     cfg=prompt_cfg, answer_mode=args.answer_mode,
                     temperature=args.temperature,
+                    rank_k=min(args.rank_k, len(class_naming.names)),
+                    sample_ranking=args.sample_ranking,
                     verbose=args.verbose, desc=f"Ep {epoch} Eval (Train)",
                 )
 
@@ -2532,6 +3040,8 @@ def main():
                     class_naming=class_naming, past_kv=past_kv,
                     cfg=prompt_cfg, answer_mode=args.answer_mode,
                     temperature=args.temperature,
+                    rank_k=min(args.rank_k, len(class_naming.names)),
+                    sample_ranking=args.sample_ranking,
                     verbose=args.verbose, desc=f"Ep {epoch} Eval (Val)",
                 )
 
