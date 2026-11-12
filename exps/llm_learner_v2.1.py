@@ -36,7 +36,7 @@ Usage
 # HuggingFaceTB/SmolLM-135M
 # HuggingFaceTB/SmolLM3-3B
 
-python exps/llm_learner.py --generic-class-names --model-name HuggingFaceTB/SmolLM3-3B \
+python exps/llm_learner_v2.1.py --generic-class-names --model-name Qwen/Qwen3-8B \
 --img-mode byte_embeds --img-reduction sum --patch-size 16 \
 --kv-policy attn_query --kv-sink 512 --kv-topk 2048 --neighbor-window 1 1 \
 --attractor-round turn_tail --attractor-temporary \
