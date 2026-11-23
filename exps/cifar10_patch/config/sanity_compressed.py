@@ -1,0 +1,16 @@
+CONFIG = {
+    "run_name": "sanity_compressed",
+    "trainer": "gradient",
+    "levels": 1,
+    "train_subset": 100,
+    "test_subset": 100,
+    "epochs": 100,
+    "batch_size": 32,
+    "codebook_sizes": [128],
+    "learning_rate": 0.01,
+    "temperature": 0.02,
+    "project_every": 1,
+    "umap_points": 800,
+    "umap_neighbors": 15,
+    "umap_enabled": True,
+}

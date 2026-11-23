@@ -1,0 +1,17 @@
+CONFIG = {
+    "run_name": "full_cifar10",
+    "trainer": "gradient",
+    "levels": 2,
+    "patch_sizes": [8, 4],
+    "train_subset": None,
+    "test_subset": None,
+    "epochs": 30,
+    "batch_size": 128,
+    "codebook_sizes": [512, 1024],
+    "learning_rate": 0.003,
+    "temperature": 0.02,
+    "project_every": 2,
+    "umap_points": 1200,
+    "umap_neighbors": 20,
+    "umap_enabled": True,
+}
