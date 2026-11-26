@@ -3,11 +3,20 @@
 Reproduce the two referenced legacy HMP figures with matching hard, continuous,
 single-level EM settings (the overlap case used five iterations in its script):
 
-    .venv/bin/python exps/cifar10_patch/train.py --config exps/cifar10_patch/config/overfit_s4_k2048.py
-    .venv/bin/python exps/cifar10_patch/train.py --config exps/cifar10_patch/config/overlap_s4_k2048_o2.py
+.venv/bin/python exps/cifar10_patch/train.py --config exps/cifar10_patch/config/overfit_s4_k2048.py
+.venv/bin/python exps/cifar10_patch/train.py --config exps/cifar10_patch/config/overlap_s4_k2048_o2.py
 
 Both runs use 100 train and 100 test images, patch=4, K=2048, hard assignments,
 and continuous means. They save their reconstruction grids under logs/cifar_patch.
+
+Joint patch-code experiments use an autoregressive mask built from the 2D grid:
+
+.venv/bin/python exps/cifar10_patch/train.py --config exps/cifar10_patch/config/overfit_s4_k2048.py --trainer gradient --context neighbor --context-radius 1 --run-name joint_neighbor
+.venv/bin/python exps/cifar10_patch/train.py --config exps/cifar10_patch/config/overfit_s4_k2048.py --trainer gradient --context full --context-rank 16 --run-name joint_full
+
+`independent` removes same-level edges, `neighbor` keeps earlier raster sites
+within a 2D Chebyshev radius, and `full` keeps all earlier sites. Context edge
+tables are offset-shared and low-rank-factorized.
 """
 from __future__ import annotations
 
@@ -33,6 +42,7 @@ DEFAULTS = {
     "run_name": "cifar_patch", "mode": "train", "trainer": "gradient",
     "data_root": "datasets", "log_root": "logs/cifar_patch", "checkpoint": None,
     "levels": 1, "patch_sizes": [8], "codebook_sizes": [2048], "overlap": 0,
+    "context": "independent", "context_radius": 1, "context_rank": 32,
     "discrete": True, "train_subset": None, "test_subset": None,
     "epochs": 10, "batch_size": 128, "learning_rate": 0.1, "temperature": 0.1,
     "project_every": 2, "num_workers": 4, "device": "auto", "seed": 0,
@@ -86,6 +96,10 @@ def parse_args():
         raise ValueError("patch_sizes currently supports 8 and 4")
     if cfg["levels"] == 2 and cfg["patch_sizes"] != [8, 4]:
         raise ValueError("two levels must use patch_sizes [8, 4]")
+    if cfg["context"] not in ("independent", "neighbor", "full"):
+        raise ValueError("context must be independent, neighbor, or full")
+    if cfg["context_radius"] < 1 or cfg["context_rank"] < 1:
+        raise ValueError("context-radius and context-rank must be positive")
     return cfg
 
 
@@ -121,39 +135,102 @@ def pairwise(x, centers):
     return (x.square().sum(1, keepdim=True) + centers.square().sum(1)[None] - 2*x @ centers.T).clamp_min_(0)
 
 
+def make_context_graph(g, mode, radius, device):
+    """Return causal edge mask M[p,q] and relative-offset ids."""
+    n_sites = g*g
+    mask = torch.zeros(n_sites, n_sites, dtype=torch.bool, device=device)
+    offsets = torch.full((n_sites, n_sites), -1, dtype=torch.long, device=device)
+    offset_ids = {}
+    for p in range(n_sites):
+        pi, pj = divmod(p, g)
+        for q in range(p):
+            qi, qj = divmod(q, g)
+            di, dj = qi-pi, qj-pj
+            allowed = mode == "full" or (mode == "neighbor" and max(abs(di), abs(dj)) <= radius)
+            if allowed:
+                delta = (di, dj)
+                if delta not in offset_ids:
+                    offset_ids[delta] = len(offset_ids)
+                mask[p, q] = True
+                offsets[p, q] = offset_ids[delta]
+    return mask, offsets, len(offset_ids)
+
+
 class PatchModel(nn.Module):
-    def __init__(self, levels, sizes, overlap=0, classes=10):
+    def __init__(self, levels, sizes, overlap=0, classes=10, context="independent",
+                 context_radius=1, context_rank=32, temperature=0.02):
         super().__init__()
         self.levels, self.sizes, self.overlap, self.classes = levels, sizes, overlap, classes
+        self.context, self.context_radius, self.context_rank = context, context_radius, context_rank
+        self.temperature = temperature
         self.codebooks = nn.ParameterList()
         self.priors = nn.ParameterList()
+        self.context_u = nn.ParameterList()
+        self.context_v = nn.ParameterList()
         for i, (size, k) in enumerate(zip(sizes, levels)):
             ext = size + 2*overlap
             self.codebooks.append(nn.Parameter(torch.rand(k, 3*ext*ext)))
             pos = (32 // size) ** 2
             self.priors.append(nn.Parameter(torch.zeros(classes, pos, k)))
+            mask, offset_ids, n_offsets = make_context_graph(32 // size, context, context_radius, torch.device("cpu"))
+            self.register_buffer(f"context_mask_{i}", mask)
+            self.register_buffer(f"context_offsets_{i}", offset_ids)
+            self.context_u.append(nn.Parameter(torch.randn(n_offsets, k, context_rank) * 0.01))
+            self.context_v.append(nn.Parameter(torch.zeros(n_offsets, context_rank, k)))
         self.parent = nn.Parameter(torch.zeros(levels[0], levels[1])) if len(levels) == 2 else None
 
     @torch.no_grad()
     def encode(self, x):
         codes = []
-        for size, centers in zip(self.sizes, self.codebooks):
-            patches = patchify(x, size, self.overlap).reshape(-1, centers.shape[1])
-            z = pairwise(patches, centers).argmin(1).reshape(x.shape[0], -1)
+        parent_codes = None
+        labels = None
+        for level, (size, centers) in enumerate(zip(self.sizes, self.codebooks)):
+            patches = patchify(x, size, self.overlap)
+            z = torch.zeros(x.shape[0], patches.shape[1], dtype=torch.long, device=x.device)
+            for p in range(patches.shape[1]):
+                prior = self.site_logits(level, labels, p, z, parent_codes)
+                dists = pairwise(patches[:, p], centers)
+                z[:, p] = (F.log_softmax(prior, -1) - dists / max(self.temperature, 1e-6)).argmax(-1)
             codes.append(z)
+            parent_codes = z
         return codes
 
-    def code_logits(self, level, labels, parent_codes=None):
-        # labels: B; return B x positions x K. Fine-level factorization adds a
-        # shared parent->child transition matrix to class/position logits.
-        logits = self.priors[level][labels]
+    def site_logits(self, level, labels, p, z_prefix, parent_codes=None):
+        if labels is None:
+            logits = self.priors[level][:, p].mean(0).expand(z_prefix.shape[0], -1)
+        else:
+            logits = self.priors[level][labels, p]
         if level == 1:
             g = 32 // self.sizes[level]
             pg = 32 // self.sizes[0]
-            mapping = torch.arange(g*g, device=labels.device)
-            parent_idx = (mapping // g * self.sizes[level] // self.sizes[0]) * pg + (mapping % g * self.sizes[level] // self.sizes[0])
+            ci, cj = divmod(p, g)
+            pi = ci * self.sizes[level] // self.sizes[0]
+            pj = cj * self.sizes[level] // self.sizes[0]
+            parent_idx = pi * pg + pj
             logits = logits + self.parent[parent_codes[:, parent_idx]]
+        mask = getattr(self, f"context_mask_{level}")
+        offset_ids = getattr(self, f"context_offsets_{level}")
+        q_sites = mask[p].nonzero().flatten()
+        if len(q_sites):
+            offsets = offset_ids[p, q_sites]
+            prior_codes = z_prefix[:, q_sites]
+            u_edges = self.context_u[level][offsets]
+            gather_idx = prior_codes[:, :, None, None].expand(-1, -1, 1, self.context_rank)
+            left = u_edges.unsqueeze(0).expand(len(labels) if labels is not None else len(z_prefix), -1, -1, -1)
+            left = left.gather(2, gather_idx).squeeze(2)
+            v_edges = self.context_v[level][offsets]
+            logits = logits + torch.einsum("bqr,qrk->bk", left, v_edges)
         return logits
+
+    def all_site_logits(self, level, labels, z_codes, parent_codes=None):
+        return torch.stack([
+            self.site_logits(level, labels, p, z_codes, parent_codes)
+            for p in range(z_codes.shape[1])
+        ], dim=1)
+
+    def code_log_probs(self, level, labels, codes, parent_codes=None):
+        logits = self.all_site_logits(level, labels, codes, parent_codes)
+        return F.log_softmax(logits, dim=-1).gather(-1, codes.unsqueeze(-1)).squeeze(-1)
 
     @torch.no_grad()
     def reconstruct(self, x):
@@ -168,9 +245,13 @@ class PatchModel(nn.Module):
                   else torch.randint(self.classes, (n,), device=device))
         zs = []
         for i, (size, cb) in enumerate(zip(self.sizes, self.codebooks)):
-            logits = self.code_logits(i, labels, zs[0] if i == 1 else None)
-            probs = (logits / max(temperature, 1e-5)).softmax(-1)
-            z = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).reshape(n, -1)
+            n_positions = (32 // size) ** 2
+            z = torch.zeros(n, n_positions, dtype=torch.long, device=device)
+            parent_codes = zs[0] if i == 1 else None
+            for p in range(n_positions):
+                logits = self.site_logits(i, labels, p, z, parent_codes)
+                probs = (logits / max(temperature, 1e-5)).softmax(-1)
+                z[:, p] = torch.multinomial(probs, num_samples=1).squeeze(1)
             zs.append(z)
         return unpatchify(self.codebooks[-1][zs[-1]], self.sizes[-1], self.overlap).clamp(0, 1)
 
@@ -212,13 +293,17 @@ def fit_gradient(model, train_loader, train_images, cfg, device, run_dir):
                 flat = patches.reshape(-1, centers.shape[-1])
                 d = pairwise(flat, centers).reshape(x.shape[0], -1, centers.shape[0])
                 with torch.no_grad():
-                    z = d.argmin(-1)
+                    z = torch.zeros(d.shape[:2], dtype=torch.long, device=device)
+                    for p in range(d.shape[1]):
+                        prior_p = model.site_logits(i, y, p, z, parents)
+                        score = F.log_softmax(prior_p, -1) - d[:, p] / max(cfg["temperature"], 1e-6)
+                        z[:, p] = score.argmax(-1)
                 # Differentiable soft exemplar reconstruction objective.
                 temp = cfg["temperature"]
                 soft = (-d / max(temp, 1e-6)).softmax(-1)
                 soft_recon = soft @ centers
                 level_rec = F.mse_loss(soft_recon, patches)
-                logits = model.code_logits(i, y, parents)
+                logits = model.all_site_logits(i, y, z, parents)
                 level_prior = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), z.reshape(-1))
                 loss = loss + level_rec + 0.1*level_prior
                 rec_loss += level_rec.detach(); prior_loss += level_prior.detach()
@@ -253,8 +338,9 @@ def fit_em(model, train_images, train_labels, cfg):
             cb[used] = sums[used] / counts[used, None]
             if cfg["discrete"]:
                 project(model, train_images)
-        # Initialize categorical position/class tables from hard assignments.
-        z = model.encode(train_images)[i]
+    # Initialize categorical position/class priors from teacher-forced codes.
+    codes = model.encode(train_images)
+    for i, z in enumerate(codes):
         table = model.priors[i]
         table.fill_(-8.)
         for c in range(10):
@@ -265,13 +351,37 @@ def fit_em(model, train_images, train_labels, cfg):
                     counts[pos].scatter_add_(0, z[mask, pos], torch.ones_like(z[mask, pos], dtype=counts.dtype))
                 table[c].copy_(counts.log())
     if model.parent is not None:
-        z0, z1 = model.encode(train_images)
+        z0, z1 = codes
         model.parent.fill_(-8.)
         counts = torch.ones_like(model.parent)
         for pos in range(z1.shape[1]):
-            pidx = ((pos // 8) // 2) * 4 + ((pos % 8) // 2)
+            child_grid = 32 // model.sizes[1]
+            parent_grid = 32 // model.sizes[0]
+            ci, cj = divmod(pos, child_grid)
+            pidx = (ci * model.sizes[1] // model.sizes[0]) * parent_grid + (cj * model.sizes[1] // model.sizes[0])
             counts.index_put_((z0[:, pidx], z1[:, pos]), torch.ones(len(z0), device=z0.device), accumulate=True)
         model.parent.copy_(counts.log())
+
+    if model.context != "independent":
+        # Learn masked transition contributions by teacher-forced conditional NLL.
+        with torch.enable_grad():
+            for i, z in enumerate(codes):
+                params = [model.priors[i], model.context_u[i], model.context_v[i]]
+                if i == 1:
+                    params.append(model.parent)
+                optimizer = torch.optim.Adam(params, lr=1e-2)
+                for epoch in tqdm(range(max(1, min(cfg["epochs"], 5))), desc=f"fit context {i+1}", leave=False):
+                    perm = torch.randperm(len(z), device=z.device)
+                    for start in range(0, len(z), 128):
+                        idx = perm[start:start+128]
+                        z_batch = z[idx]
+                        y_batch = train_labels[idx]
+                        parent_batch = codes[i-1][idx] if i > 0 else None
+                        logits = model.all_site_logits(i, y_batch, z_batch, parent_batch)
+                        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), z_batch.reshape(-1))
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        optimizer.step()
 
 
 @torch.no_grad()
@@ -284,9 +394,10 @@ def evaluate(model, loader, device):
         scores = torch.zeros(len(x), 10, device=device)
         for c in range(10):
             cls = torch.full_like(y, c)
+            parents = None
             for i, z in enumerate(codes):
-                logits = model.code_logits(i, cls, codes[0] if i == 1 else None).log_softmax(-1)
-                scores[:, c] += logits.gather(-1, z.unsqueeze(-1)).squeeze(-1).sum(-1)
+                scores[:, c] += model.code_log_probs(i, cls, z, parents).sum(-1)
+                parents = z
         true_logp = scores.log_softmax(-1).gather(1, y[:, None]).sum().item()
         total_nll -= true_logp
         preds = scores.argmax(-1)
@@ -305,9 +416,10 @@ def code_nll(model, loader, device, conditional=True):
         count += sum(z.numel() for z in codes)
         if conditional:
             seq_logp = torch.zeros(len(x), device=device)
+            parents = None
             for i, z in enumerate(codes):
-                lp = model.code_logits(i, y, codes[0] if i == 1 else None).log_softmax(-1)
-                seq_logp += lp.gather(-1, z[..., None]).squeeze(-1).sum(-1)
+                seq_logp += model.code_log_probs(i, y, z, parents).sum(-1)
+                parents = z
             total -= seq_logp.sum().item()
         else:
             # Class is a shared latent for the whole image: marginalize after
@@ -316,9 +428,10 @@ def code_nll(model, loader, device, conditional=True):
             for c in range(10):
                 labels = torch.full_like(y, c)
                 seq_logp = torch.zeros(len(x), device=device)
+                parents = None
                 for i, z in enumerate(codes):
-                    lp = model.code_logits(i, labels, codes[0] if i == 1 else None).log_softmax(-1)
-                    seq_logp += lp.gather(-1, z[..., None]).squeeze(-1).sum(-1)
+                    seq_logp += model.code_log_probs(i, labels, z, parents).sum(-1)
+                    parents = z
                 class_seq_logp.append(seq_logp)
             total -= (torch.logsumexp(torch.stack(class_seq_logp), dim=0) - math.log(10)).sum().item()
     return total/max(count, 1)
@@ -402,7 +515,9 @@ def main():
     test_images = torch.stack([test_ds[i][0] for i in range(len(test_ds))]).to(device)
 
     
-    model = PatchModel(cfg["codebook_sizes"], sizes, cfg["overlap"]).to(device)
+    model = PatchModel(cfg["codebook_sizes"], sizes, cfg["overlap"],
+                       context=cfg["context"], context_radius=cfg["context_radius"],
+                       context_rank=cfg["context_rank"], temperature=cfg["temperature"]).to(device)
     if cfg["checkpoint"]:
         state = torch.load(cfg["checkpoint"], map_location=device, weights_only=False)
         model.load_state_dict(state["model"]); print(f"Loaded checkpoint: {Path(cfg['checkpoint']).resolve()}")
