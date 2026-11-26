@@ -3,115 +3,126 @@
 The vocabulary is never extended: selected existing token IDs stand for visual
 patch centroids. The shared codebook is fitted across all patch positions.
 
-Run from the repository root (adjust MODEL_NAME and other constants below):
+Examples from the repository root:
 
     .venv/bin/python exps/cifar10_patch/cifar_classify_icl.py
+    .venv/bin/python exps/cifar10_patch/cifar_classify_icl.py --model Qwen/Qwen3-8B --patch-size 8 --k 128
+    .venv/bin/python exps/cifar10_patch/cifar_classify_icl.py --eval-train --train-eval-subset 100
+    # Reproduce v2's shuffled 100-example train recall sanity evaluation with Qwen:
+    .venv/bin/python exps/cifar10_patch/cifar_classify_icl.py --model Qwen/Qwen3-8B --train-subset 100 --subset-sampling shuffled --eval-teach --seed 0 --patch-size 16 --k 256 --kmeans-samples 100000 --kmeans-iters 50 --prediction-mode generate --answer-prefix ''
+    .venv/bin/python exps/cifar10_patch/cifar_classify_icl.py --prediction-mode full_prob --answer-prefix "Class: "
+    .venv/bin/python exps/cifar10_patch/cifar_classify_icl.py --use-reasoning --max-reasoning-tokens 512 --answer-prefill-after-reasoning
 
-Example configurations (edit the constants in CONFIG before running):
-
-    # Qwen3, 2x2 patches, 128 centroids, full configured demonstration set
-    MODEL_NAME = "Qwen/Qwen3-8B"
-    PATCH_SIZE = 16
-    KMEANS_CENTROIDS = 128
-    TRAIN_SUBSET_SIZE = 100
-    EVAL_SUBSET_SIZE = None
-
-    # SmolLM3, 4x4 patches, 64 centroids, quick evaluation on 20 queries
-    MODEL_NAME = "HuggingFaceTB/SmolLM3-3B"
-    PATCH_SIZE = 8
-    KMEANS_CENTROIDS = 64
-    TRAIN_SUBSET_SIZE = 100
-    EVAL_SUBSET_SIZE = 20
-    PREDICTION_MODE = "generate"
-
-    # Coarser patches, larger codebook, smaller demonstration set
-    MODEL_NAME = "HuggingFaceTB/SmolLM3-3B"
-    PATCH_SIZE = 32
-    KMEANS_CENTROIDS = 256
-    TRAIN_SUBSET_SIZE = 50
-    EVAL_SUBSET_SIZE = 10
-    PREDICTION_MODE = "generate"
-
-PATCH_SIZE must divide IMAGE_SIZE. The default shared codebook is used for all
-spatial positions. K-means fits on the configured training demonstrations, so
-increase TRAIN_SUBSET_SIZE to expose it to more CIFAR patches. For a fixed
-contiguous vocabulary interval, set CENTROID_TOKEN_START to its first token ID;
-otherwise the selector searches for a printable interval automatically.
+The defaults teach on 1,000 balanced train examples and evaluate on 100
+balanced test examples. --eval-train evaluates a disjoint train sanity subset;
+--eval-teach instead repeats each teaching image as a query, matching v2's
+train recall sanity protocol. Balanced subset sizes must be multiples of 10.
+Use --subset-sampling shuffled for v2's seeded shuffle-and-slice sampling. The
+shared codebook is fitted on teaching images only; all query splits reuse one
+unchanged teaching KV cache.
+Patch size must divide 32. Vocabulary entries are existing model tokens.
 """
 
+import argparse
 import copy
 import random
 import time
+from pathlib import Path
 
 import torch
 import torchvision
 import torchvision.transforms as T
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
+import json
 
 # =============================================================================
-# CONFIG
+# CLI
 # =============================================================================
-
-# Supported choices: "Qwen/Qwen3-8B" or "HuggingFaceTB/SmolLM3-3B".
-# Qwen3 is the original sanity-check model; SmolLM3-3B is a smaller alternative.
-# MODEL_NAME = "Qwen/Qwen3-8B"
-MODEL_NAME = "HuggingFaceTB/SmolLM3-3B"
-DATA_DIR = "./datasets"
-
-TRAIN_SUBSET_SIZE = 100
-SHUFFLE_SEED = 0          # None = original CIFAR-10 train dataset order
-EVAL_DATASET_INDEX = 50   # Index into the selected subset for single-sample diagnostics
-
-# K-means tokenizer. PATCH_SIZE must divide IMAGE_SIZE. All positions share
-# this codebook by default. CENTROID_TOKEN_START selects a contiguous usable
-# token range; set None to use the vocabulary filter's first eligible range.
-PATCH_SIZE = 16
-KMEANS_CENTROIDS = 128
-KMEANS_SAMPLES = 100000
-KMEANS_ITERS = 50
-CENTROID_TOKEN_START = None
-VOCAB_FILTER = "printable"  # "printable" or stub selector "unicode_script"
-
-# Eval sanity train:
-# True  = evaluate accuracy across all examples in the trainset and report final accuracy.
-# False = evaluate only a single query sample.
-EVAL_SANITY_TRAIN = True
-
-# Subset of trainset for accelerated evaluation:
-# None or 0 = evaluate on all examples in TRAIN_SUBSET_SIZE.
-# Else integer > 0 = random subset of size EVAL_SUBSET_SIZE (must be <= TRAIN_SUBSET_SIZE).
-EVAL_SUBSET_SIZE = None
-
-IMAGE_SIZE = 32
-PATCH_SIZE = 16
-PATCH_COUNT = (IMAGE_SIZE // PATCH_SIZE) ** 2
 
 CLASS_NAMES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
-VERBOSE = True
-TOP_K = 20
-
-# Prediction conventions follow llm_icl_sanity_cifar_teach.py.
-PREDICTION_MODE = "generate"  # "generate", "first_token", or "full_prob"
-ANSWER_PREFIX = ""  # Optional assistant text before the class label.
-MAX_LABEL_TOKENS = 8
-
+IMAGE_SIZE = 32
 EMBED_PREFIX = ""
 LABEL_SEPARATOR = " : "
 INITIAL_ACK = "Understood."
 EXAMPLE_NEWLINE = "\n"
 EVAL_PROMPT = ""
+THINK_OPEN = "<think>\n"
 
-INITIAL_INSTRUCTION = (
-    "You are learning an image classification task through in-context examples. "
-    "Each example is presented as text embeds: followed by image patch tokens, "
-    "then a colon and its class label. The final item is an image followed by "
-    "a colon with no label. Infer its class from the preceding examples. "
-    "The available class labels are: "
-    + ", ".join(CLASS_NAMES)
-    + ". Reply immediately only with one of these labels, " + ", ".join(CLASS_NAMES) + "."
-)
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default="Qwen/Qwen3-8B",
+    # parser.add_argument("--model", default="HuggingFaceTB/SmolLM3-3B",
+                        help="HF model ID, e.g. Qwen/Qwen3-8B or HuggingFaceTB/SmolLM3-3B")
+    parser.add_argument("--data-root", type=Path, default=Path("datasets"))
+    parser.add_argument("--train-subset", type=int, default=1000,
+                        help="balanced labeled teaching examples; multiple of 10")
+    parser.add_argument("--subset-sampling", choices=("balanced", "shuffled"), default="balanced",
+                        help="balanced class counts, or v2-compatible random shuffled ordering")
+    parser.add_argument("--test-subset", type=int, default=100,
+                        help="balanced test examples; multiple of 10")
+    parser.add_argument("--eval-train", action="store_true",
+                        help="also evaluate a disjoint balanced subset of the train split")
+    parser.add_argument("--eval-teach", action="store_true",
+                        help="evaluate the teaching examples themselves (v2 train recall sanity mode)")
+    parser.add_argument("--train-eval-subset", type=int, default=100,
+                        help="balanced train sanity examples; multiple of 10")
+    parser.add_argument("--patch-size", type=int, choices=(1, 2, 4, 8, 16, 32), default=16)
+    parser.add_argument("--k", type=int, default=256, help="shared K-means centroid count")
+    parser.add_argument("--kmeans-samples", type=int, default=100000)
+    parser.add_argument("--kmeans-iters", type=int, default=50)
+    parser.add_argument("--centroid-token-start", type=int, default=None)
+    parser.add_argument("--vocab-filter", choices=("printable", "unicode_script"), default="printable")
+    parser.add_argument("--prediction-mode", choices=("generate", "first_token", "full_prob"), default="generate")
+    parser.add_argument("--answer-prefix", default="")
+    parser.add_argument("--use-reasoning", action="store_true",
+                        help="generate a bounded <think>...</think> section before the answer")
+    parser.add_argument("--max-reasoning-tokens", type=int, default=512)
+    parser.add_argument("--reasoning-temperature", type=float, default=0.6)
+    parser.add_argument("--reasoning-top-p", type=float, default=0.95)
+    parser.add_argument("--answer-prefill-after-reasoning", action="store_true",
+                        help="insert --reasoning-answer-prefix after </think>")
+    parser.add_argument("--reasoning-answer-prefix", default="The class of the final item is: ")
+    parser.add_argument("--max-label-tokens", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output", type=Path, default=Path("logs/cifar_patch/icl_scores.json"))
+    parser.add_argument("--quiet", action="store_true")
+    return parser.parse_args()
+
+
+def select_indices(targets, count, seed, sampling="balanced", excluded=()):
+    if count <= 0:
+        raise ValueError(f"Subset size must be positive, got {count}")
+    excluded = set(excluded)
+    rng = random.Random(seed)
+    if sampling == "shuffled":
+        pool = [i for i in range(len(targets)) if i not in excluded]
+        rng.shuffle(pool)
+        if count > len(pool):
+            raise ValueError(f"Requested {count} examples from a pool of {len(pool)}")
+        return pool[:count]
+    if count % 10:
+        raise ValueError(f"Balanced subset size must be a multiple of 10, got {count}")
+    per_class = count // 10
+    pools = []
+    for class_id in range(10):
+        pool = [i for i, target in enumerate(targets) if int(target) == class_id and i not in excluded]
+        rng.shuffle(pool)
+        if len(pool) < per_class:
+            raise ValueError(f"Class {class_id} has {len(pool)} eligible examples; {per_class} required")
+        pools.append(pool[:per_class])
+    return [pools[c][j] for j in range(per_class) for c in range(10)]
+
+
+def make_instruction():
+    labels = ", ".join(CLASS_NAMES)
+    return (
+        "You are learning an image classification task through in-context examples. "
+        "Each example is presented as text embeds: followed by image patch tokens, "
+        "then a colon and its class label. The final item is an image followed by "
+        "a colon with no label. Infer its class from the preceding examples. "
+        f"The available class labels are: {labels}. Reply immediately only with one of these labels, {labels}."
+    )
 
 
 # =============================================================================
@@ -221,28 +232,43 @@ def append_text(parts, model, tokenizer, text, device, dtype):
 # CIFAR-10
 # =============================================================================
 
-def load_cifar10_examples():
+def load_cifar10_examples(args):
     transform = T.Compose([
         T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         T.ToTensor(),
     ])
     train_set = torchvision.datasets.CIFAR10(
-        root=DATA_DIR, train=True, download=True, transform=transform
+        root=str(args.data_root), train=True, download=True, transform=transform
+    )
+    test_set = torchvision.datasets.CIFAR10(
+        root=str(args.data_root), train=False, download=True, transform=transform
+    )
+    teach_indices = select_indices(
+        train_set.targets, args.train_subset, args.seed, args.subset_sampling
+    )
+    train_eval_indices = []
+    if args.eval_train and not args.eval_teach:
+        train_eval_indices = select_indices(
+            train_set.targets, args.train_eval_subset, args.seed + 1,
+            args.subset_sampling, excluded=teach_indices,
+        )
+    test_indices = select_indices(
+        test_set.targets, args.test_subset, args.seed + 2, args.subset_sampling
     )
 
-    indices = list(range(len(train_set)))
-    if SHUFFLE_SEED is not None:
-        random.Random(SHUFFLE_SEED).shuffle(indices)
-    indices = indices[:min(TRAIN_SUBSET_SIZE, len(indices))]
+    def examples_from(dataset, indices, offset=0):
+        result = []
+        for index in indices:
+            image, target = dataset[index]
+            result.append((offset + index, image, CLASS_NAMES[int(target)]))
+        return result
 
-    # Keep original CIFAR-10 training-split index, image tensor, and label.
-    examples = []
-    for dataset_index in indices:
-        image, target = train_set[dataset_index]
-        label = CLASS_NAMES[int(target)]
-        examples.append((dataset_index, image, label))
-
-    return train_set, examples
+    return (
+        train_set,
+        examples_from(train_set, teach_indices),
+        examples_from(train_set, train_eval_indices),
+        examples_from(test_set, test_indices, offset=len(train_set)),
+    )
 
 
 # =============================================================================
@@ -377,14 +403,16 @@ def build_demonstration_embeds(model, tokenizer, tags, examples, code_by_index, 
 
 
 @torch.no_grad()
-def build_query_embeds(model, tokenizer, tags, query_example, code_by_index, centroid_token_ids, device, dtype):
+def build_query_embeds(model, tokenizer, tags, query_example, code_by_index, centroid_token_ids,
+                       device, dtype, use_reasoning=False):
     """Build query suffix embeddings (query item + colon + assistant turn tags)."""
     q_idx, _, _ = query_example
     parts = []
     append_text(parts, model, tokenizer, tags["turn_separator"] + EVAL_PROMPT + "\n" + EMBED_PREFIX, device, dtype)
     parts.append(image_codes_to_embeds(model, code_by_index[q_idx], centroid_token_ids, device, dtype))
 
-    suffix = LABEL_SEPARATOR + tags["user_close"] + tags["asst_open"] + ANSWER_PREFIX
+    suffix = LABEL_SEPARATOR + tags["user_close"] + tags["asst_open"]
+    suffix += THINK_OPEN if use_reasoning else ANSWER_PREFIX
     append_text(parts, model, tokenizer, suffix, device, dtype)
 
     return torch.cat([p for p in parts if p.shape[1] > 0], dim=1)
@@ -401,7 +429,7 @@ def decode_answer(
     past_kv,
     initial_logits,
     device,
-    max_tokens=MAX_LABEL_TOKENS,
+    max_tokens=8,
     query_desc="",
 ):
     """Greedily generate a short answer continuation, following the teaching script."""
@@ -446,6 +474,59 @@ def decode_answer(
 
 
 @torch.no_grad()
+def decode_reasoning(model, tokenizer, past_kv, initial_logits, device,
+                     max_tokens, temperature, top_p, query_desc=""):
+    """Generate a bounded reasoning section and advance past its closing tag."""
+    close_id = tokenizer.convert_tokens_to_ids("</think>")
+    eos_id = tokenizer.eos_token_id
+    current_cache = past_kv
+    logits = initial_logits
+    generated = []
+    closed = False
+    started = time.time()
+    with torch.inference_mode():
+        for _ in range(max_tokens):
+            if temperature <= 0:
+                next_id = int(logits.argmax().item())
+            else:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                sorted_probs, sorted_ids = probs.sort(descending=True)
+                cumulative = sorted_probs.cumsum(0)
+                remove = cumulative - sorted_probs > top_p
+                sorted_probs[remove] = 0
+                sorted_probs /= sorted_probs.sum().clamp_min(1e-12)
+                next_id = int(sorted_ids[torch.multinomial(sorted_probs, 1)].item())
+            if next_id == close_id:
+                closed = True
+                break
+            if eos_id is not None and next_id == eos_id:
+                break
+            generated.append(next_id)
+            output = model(
+                input_ids=torch.tensor([[next_id]], device=device),
+                past_key_values=current_cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            current_cache = output.past_key_values
+            logits = output.logits[0, -1].float()
+    elapsed = time.time() - started
+    if VERBOSE:
+        trace = tokenizer.decode(generated, skip_special_tokens=True).strip()
+        print(f"Reasoning{f' ({query_desc})' if query_desc else ''}: {trace!r}; "
+              f"tokens={len(generated)}/{max_tokens}, closed={closed}, time={elapsed:.2f}s")
+    closing = tokenizer("</think>" + "\n\n", add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    with torch.inference_mode():
+        output = model(
+            input_ids=closing,
+            past_key_values=current_cache,
+            use_cache=True,
+            return_dict=True,
+        )
+    return output.past_key_values, output.logits[0, -1].float(), generated, closed, elapsed
+
+
+@torch.no_grad()
 def predict_query(
     model,
     tokenizer,
@@ -453,6 +534,7 @@ def predict_query(
     query_embeds,
     device,
     label_token_ids,
+    settings,
     query_desc="",
 ):
     """Evaluate a query with the teaching script's short answer-prefix convention."""
@@ -466,11 +548,32 @@ def predict_query(
     curr_cache = query_out.past_key_values
     current_logits = query_out.logits[0, -1, :].float()
 
+    reasoning_time = 0.0
+    if settings.use_reasoning:
+        curr_cache, current_logits, _, _, reasoning_time = decode_reasoning(
+            model, tokenizer, curr_cache, current_logits, device,
+            settings.max_reasoning_tokens, settings.reasoning_temperature,
+            settings.reasoning_top_p, query_desc,
+        )
+        if settings.answer_prefill_after_reasoning and settings.reasoning_answer_prefix:
+            answer_prefill = embed_text(
+                model, tokenizer, settings.reasoning_answer_prefix, device, query_embeds.dtype
+            )
+            with torch.inference_mode():
+                prefill_out = model(
+                    inputs_embeds=answer_prefill,
+                    past_key_values=curr_cache,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            curr_cache = prefill_out.past_key_values
+            current_logits = prefill_out.logits[0, -1, :].float()
+
     class_logits = current_logits[torch.tensor([label_token_ids[label] for label in CLASS_NAMES], device=current_logits.device)]
     class_probs = torch.softmax(class_logits, dim=0).cpu()
     if PREDICTION_MODE == "first_token":
         pred_class = CLASS_NAMES[int(class_probs.argmax().item())]
-        return pred_class, current_logits, class_probs, [], True, 0.0
+        return pred_class, current_logits, class_probs, [], True, reasoning_time
     if PREDICTION_MODE == "full_prob":
         log_scores = []
         for label in CLASS_NAMES:
@@ -487,7 +590,7 @@ def predict_query(
             log_scores.append(torch.log_softmax(candidate_out.logits[0, -2].float(), dim=-1)[label_id])
         class_probs = torch.softmax(torch.stack(log_scores), dim=0).cpu()
         pred_class = CLASS_NAMES[int(class_probs.argmax().item())]
-        return pred_class, current_logits, class_probs, [], True, 0.0
+        return pred_class, current_logits, class_probs, [], True, reasoning_time
     if PREDICTION_MODE != "generate":
         raise ValueError(f"Unknown PREDICTION_MODE: {PREDICTION_MODE}")
     _, _, generated_ids, stopped, elapsed = decode_answer(
@@ -495,7 +598,7 @@ def predict_query(
     )
     answer = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     pred_class = next((label for label in CLASS_NAMES if answer.startswith(label)), answer)
-    return pred_class, current_logits, class_probs, generated_ids, stopped, elapsed
+    return pred_class, current_logits, class_probs, generated_ids, stopped, elapsed + reasoning_time
 
 
 @torch.no_grad()
@@ -510,26 +613,29 @@ def evaluate_sanity_train(
     device,
     dtype,
     label_token_ids,
+    settings,
+    split_name,
 ):
-    """Evaluate accuracy across the evaluation examples and report accuracy."""
+    """Evaluate queries from isolated copies of the shared teaching KV cache."""
     correct = 0
     total = 0
     per_class = {label: [0, 0] for label in CLASS_NAMES}
+    records = []
 
-    print(f"\nRunning eval sanity train across {len(eval_examples)} examples...")
-    progress = tqdm(eval_examples, desc="Eval Sanity Train", disable=not VERBOSE)
+    print(f"\nEvaluating {split_name} on {len(eval_examples)} examples...")
+    progress = tqdm(eval_examples, desc=f"Eval {split_name}", disable=not VERBOSE)
     for q_idx, q_image, true_label in progress:
         query_embeds = build_query_embeds(
             model, tokenizer, tags,
             (q_idx, q_image, true_label),
             code_by_index, centroid_token_ids,
-            device, dtype,
+            device, dtype, use_reasoning=settings.use_reasoning,
         )
         curr_cache = copy.deepcopy(base_cache)
         query_desc = f"eval {total + 1}/{len(eval_examples)}: index={q_idx}, true={true_label}"
         pred_label, logits, class_probs, reasoning_tokens, closed_naturally, reasoning_time = predict_query(
             model, tokenizer, curr_cache, query_embeds,
-            device, label_token_ids,
+            device, label_token_ids, settings,
             query_desc=query_desc,
         )
 
@@ -538,18 +644,26 @@ def evaluate_sanity_train(
         total += 1
         per_class[true_label][1] += 1
         per_class[true_label][0] += int(is_correct)
+        records.append({
+            "dataset_index": q_idx,
+            "true_label": true_label,
+            "predicted_label": pred_label,
+            "correct": is_correct,
+            "scores": {label: float(score) for label, score in zip(CLASS_NAMES, class_probs.tolist())},
+        })
         progress.set_postfix(accuracy=f"{100.0 * correct / total:.2f}%")
 
     accuracy = 100.0 * correct / max(1, total)
     print("\n" + "=" * 88)
-    print(f"EVAL SANITY TRAIN FINAL ACCURACY: {accuracy:.2f}% ({correct}/{total})")
+    print(f"{split_name.upper()} ACCURACY: {accuracy:.2f}% ({correct}/{total})")
     print("=" * 88)
     print("Per-class accuracy breakdown:")
     for label, (class_correct, class_total) in per_class.items():
         pct = 100.0 * class_correct / class_total if class_total else 0.0
         print(f"  Class {label}: {class_correct:3d} / {class_total:3d} ({pct:5.1f}%)")
     print("=" * 88)
-    return accuracy
+    return {"accuracy": accuracy, "correct": correct, "total": total,
+            "per_class": per_class, "examples": records}
 
 
 # =============================================================================
@@ -558,37 +672,53 @@ def evaluate_sanity_train(
 
 @torch.no_grad()
 def main():
-    print(f"Loading CIFAR-10 training split (subset size = {TRAIN_SUBSET_SIZE})...")
-    train_set, examples = load_cifar10_examples()
+    global INITIAL_INSTRUCTION, ANSWER_PREFIX, MAX_LABEL_TOKENS, PREDICTION_MODE, VERBOSE
+    args = parse_args()
+    required_sizes = [("train-subset", args.train_subset), ("test-subset", args.test_subset)]
+    if args.eval_train and not args.eval_teach:
+        required_sizes.append(("train-eval-subset", args.train_eval_subset))
+    for name, value in required_sizes:
+        if value <= 0 or (args.subset_sampling == "balanced" and value % 10):
+            suffix = " and a multiple of 10" if args.subset_sampling == "balanced" else ""
+            raise ValueError(f"--{name} must be positive{suffix}, got {value}")
+    if args.k < 1 or args.kmeans_samples < 1 or args.kmeans_iters < 1 or args.max_label_tokens < 1:
+        raise ValueError("--k, --kmeans-samples, --kmeans-iters, and --max-label-tokens must be positive")
+    if args.max_reasoning_tokens < 1:
+        raise ValueError("--max-reasoning-tokens must be positive")
+    if args.reasoning_temperature < 0:
+        raise ValueError("--reasoning-temperature must be non-negative")
+    if not 0 < args.reasoning_top_p <= 1:
+        raise ValueError("--reasoning-top-p must be in (0, 1]")
+    if args.use_reasoning and args.prediction_mode != "generate":
+        raise ValueError("--use-reasoning currently requires --prediction-mode generate")
+    if args.answer_prefill_after_reasoning and not args.use_reasoning:
+        raise ValueError("--answer-prefill-after-reasoning requires --use-reasoning")
+    if IMAGE_SIZE % args.patch_size:
+        raise ValueError(f"--patch-size={args.patch_size} must divide image size {IMAGE_SIZE}")
 
-    # Determine subset of trainset to use for evaluation
-    if EVAL_SUBSET_SIZE and EVAL_SUBSET_SIZE > 0:
-        if EVAL_SUBSET_SIZE > len(examples):
-            raise ValueError(
-                f"EVAL_SUBSET_SIZE={EVAL_SUBSET_SIZE} must be <= trainset size ({len(examples)})."
-            )
-        eval_examples = random.Random(SHUFFLE_SEED).sample(examples, EVAL_SUBSET_SIZE)
-        print(f"Using random evaluation subset: {len(eval_examples)} of {len(examples)} examples.")
-    else:
-        eval_examples = examples
-        print(f"Using full training set for evaluation: {len(eval_examples)} examples.")
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    VERBOSE = not args.quiet
+    PREDICTION_MODE = args.prediction_mode
+    ANSWER_PREFIX = args.answer_prefix
+    MAX_LABEL_TOKENS = args.max_label_tokens
+    INITIAL_INSTRUCTION = make_instruction()
 
-    # Select single query item for primary diagnostics
-    if EVAL_DATASET_INDEX is None:
-        eval_example = random.choice(examples)
-    else:
-        eval_example = examples[EVAL_DATASET_INDEX]
+    train_eval_count = args.train_subset if args.eval_teach else (args.train_eval_subset if args.eval_train else 0)
+    print(f"Loading CIFAR subsets: teach={args.train_subset}, test={args.test_subset}, "
+          f"train_eval={train_eval_count}, sampling={args.subset_sampling}")
+    train_set, teach_examples, train_eval_examples, test_examples = load_cifar10_examples(args)
+    if args.eval_teach:
+        train_eval_examples = teach_examples
+    print(f"Train teach: {len(teach_examples)}; test evaluation: {len(test_examples)}")
+    if args.eval_train or args.eval_teach:
+        print(f"Train sanity evaluation: {len(train_eval_examples)} "
+              f"({'teaching examples' if args.eval_teach else 'disjoint examples'})")
 
-    eval_index, eval_image, eval_label = eval_example
-
-    print("\nCIFAR-10 class mapping:")
-    for class_id, class_name in enumerate(train_set.classes):
-        print(f"  CIFAR class {class_id:2d} {class_name:12s} -> {CLASS_NAMES[class_id]}")
-
-    print("\nLoading tokenizer and model...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    print(f"Loading {args.model}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        args.model,
         torch_dtype="auto",
         device_map="auto" if torch.cuda.is_available() else None,
     )
@@ -596,119 +726,102 @@ def main():
     device = model.get_input_embeddings().weight.device
     dtype = model.get_input_embeddings().weight.dtype
 
-    # Validate class labels map to single tokens
     label_token_ids = {}
     for label in CLASS_NAMES:
         ids = tokenizer(" " + label, add_special_tokens=False).input_ids
         if len(ids) != 1:
-            raise ValueError(f"Class label {label!r} is not a single token: {ids}.")
-        label_token_ids[label] = ids[0]
+            raise ValueError(f"Class label {label!r} is not a single token: {ids}")
+        label_token_ids[label] = int(ids[0])
 
-    if IMAGE_SIZE % PATCH_SIZE:
-        raise ValueError(f"PATCH_SIZE={PATCH_SIZE} must divide IMAGE_SIZE={IMAGE_SIZE}")
-    print(f"\nFitting shared K-means patch tokenizer (patch={PATCH_SIZE}, k={KMEANS_CENTROIDS})...")
+    print(f"Fitting shared patch K-means: patch={args.patch_size}, k={args.k}")
     centers = fit_patch_codebook(
-        torch.stack([image for _, image, _ in examples]), PATCH_SIZE, KMEANS_CENTROIDS,
-        KMEANS_SAMPLES, KMEANS_ITERS, device, SHUFFLE_SEED or 0,
+        torch.stack([image for _, image, _ in teach_examples]),
+        args.patch_size, args.k, args.kmeans_samples, args.kmeans_iters,
+        device, args.seed,
     )
+    all_examples = teach_examples + train_eval_examples + test_examples
     code_by_index = {}
-    for start in range(0, len(examples), 128):
-        batch_examples = examples[start:start + 128]
-        batch_codes = patchify_encode(torch.stack([image for _, image, _ in batch_examples]), centers, PATCH_SIZE, device)
-        code_by_index.update({ex[0]: code for ex, code in zip(batch_examples, batch_codes)})
-    if VOCAB_FILTER == "unicode_script":
+    for start in range(0, len(all_examples), 128):
+        batch_examples = all_examples[start:start + 128]
+        batch_codes = patchify_encode(
+            torch.stack([image for _, image, _ in batch_examples]),
+            centers, args.patch_size, device,
+        )
+        code_by_index.update({
+            example[0]: code for example, code in zip(batch_examples, batch_codes)
+        })
+
+    if args.vocab_filter == "unicode_script":
         centroid_token_ids = unicode_script_vocab_stub(tokenizer, len(centers))
     else:
-        centroid_token_ids = contiguous_vocab_range(tokenizer, len(centers), CENTROID_TOKEN_START)
-    print(f"Mapped {len(centers)} centroids to existing vocabulary IDs "
-          f"[{centroid_token_ids[0]}, {centroid_token_ids[-1] + 1}); vocabulary unchanged.")
-
-    print("\nSelected training examples:")
-    for i, (dataset_index, _, label) in enumerate(examples):
-        patch_tokens = " ".join(
-            tokenizer.decode([centroid_token_ids[int(code)]]) for code in code_by_index[dataset_index]
+        centroid_token_ids = contiguous_vocab_range(
+            tokenizer, len(centers), args.centroid_token_start
         )
-        print(f"  {i:3d} index={dataset_index:5d}  patches={patch_tokens!r}  label={label}")
-    print(f"\nDiagnostic query index={eval_index}; class={eval_label}; "
-          f"patch codes={code_by_index[eval_index].tolist()}")
+    print(
+        f"Centroids map to existing vocabulary IDs "
+        f"[{centroid_token_ids[0]}, {centroid_token_ids[-1] + 1}); vocabulary unchanged."
+    )
 
     tags = extract_chat_tags(tokenizer)
-    display_conversation = build_display_conversation(
-        tags, examples, eval_example, code_by_index, centroid_token_ids, tokenizer
-    )
-
+    display_query = test_examples[0]
     if VERBOSE:
-        print("\n" + "=" * 88)
-        print("FULL RAW PREFILL CONVERSATION (INCLUDING CHAT TAGS)")
-        print("=" * 88)
-        print(display_conversation, end="")
-        print("\n" + "=" * 88)
-        print("END OF RAW PREFILL CONVERSATION")
-        print("=" * 88)
+        display = build_display_conversation(
+            tags, teach_examples, display_query, code_by_index, centroid_token_ids, tokenizer
+        )
+        print("\n" + "=" * 80)
+        print(display, end="")
+        print("\n" + "=" * 80)
 
-    # Build shared demonstration prefix
-    print("\nPrefilling demonstration context into base KV cache...")
+    print("Prefilling teaching examples once and preserving the base KV cache...")
     demo_embeds = build_demonstration_embeds(
-        model, tokenizer, tags, examples, code_by_index, centroid_token_ids, device, dtype
+        model, tokenizer, tags, teach_examples, code_by_index,
+        centroid_token_ids, device, dtype,
     )
-    print(f"Demonstration context token count: {demo_embeds.shape[1]}")
-
     with torch.inference_mode():
         demo_out = model(inputs_embeds=demo_embeds, use_cache=True, return_dict=True)
     base_cache = demo_out.past_key_values
 
-    # Step diagnostic query sample
-    print("\nEvaluating diagnostic query sample...")
-    diag_query_embeds = build_query_embeds(
-        model, tokenizer, tags, eval_example, code_by_index, centroid_token_ids,
-        device, dtype,
-    )
-    diag_cache = copy.deepcopy(base_cache)
-    pred_class, logits, class_probs, reasoning_tokens, closed_naturally, reasoning_time = predict_query(
-        model, tokenizer, diag_cache, diag_query_embeds, device, label_token_ids,
-        query_desc="DIAGNOSTIC QUERY",
-    )
-
-    if VERBOSE:
-        full_vocab_probs = torch.softmax(logits, dim=-1)
-        print("\nTop next-token logits and full-vocabulary softmax:")
-        top_values, top_ids = torch.topk(logits, min(TOP_K, logits.numel()))
-        for token_id, logit in zip(top_ids.tolist(), top_values.tolist()):
-            probability = float(full_vocab_probs[token_id].item())
-            token_text = tokenizer.decode([token_id])
-            print(
-                f"  token={token_id:7d}  text={token_text!r:16s}  "
-                f"logit={logit:10.4f}  softmax={probability:.8e}"
-            )
-
-        print("\nClass-token scores:")
-        for label, token_id, class_prob in zip(
-            CLASS_NAMES,
-            [label_token_ids[label] for label in CLASS_NAMES],
-            class_probs.tolist(),
-        ):
-            class_logit = float(logits[token_id].item())
-            full_prob = float(full_vocab_probs[token_id].item())
-            print(
-                f"  {label}: token_id={token_id:6d}  logit={class_logit:10.4f}  "
-                f"class_softmax={class_prob:.8f}  full_vocab_softmax={full_prob:.8e}"
-            )
-
-    greedy_token_id = int(torch.argmax(logits).item())
-    greedy_text = tokenizer.decode([greedy_token_id], skip_special_tokens=True).strip()
-
-    print("\nDiagnostic query result:")
-    print(f"  greedy next token = {greedy_text!r} (token_id={greedy_token_id})")
-    print(f"  best class pred   = {pred_class}")
-    print(f"  reference label   = {eval_label}")
-    print(f"  correct           = {pred_class == eval_label}")
-
-    # Run full eval sanity train if enabled
-    if EVAL_SANITY_TRAIN:
-        evaluate_sanity_train(
-            model, tokenizer, tags, code_by_index, centroid_token_ids, eval_examples, base_cache,
-            device, dtype, label_token_ids,
+    # Each split evaluation starts every query from a fresh copy of this same
+    # teaching cache; query tokens never accumulate in the shared cache.
+    results = {
+        "config": {
+            "model": args.model,
+            "train_subset": args.train_subset,
+            "test_subset": args.test_subset,
+            "eval_train": args.eval_train or args.eval_teach,
+            "eval_teach": args.eval_teach,
+            "subset_sampling": args.subset_sampling,
+            "train_eval_subset": len(train_eval_examples),
+            "patch_size": args.patch_size,
+            "k": len(centers),
+            "prediction_mode": args.prediction_mode,
+            "answer_prefix": args.answer_prefix,
+            "use_reasoning": args.use_reasoning,
+            "max_reasoning_tokens": args.max_reasoning_tokens,
+            "reasoning_temperature": args.reasoning_temperature,
+            "reasoning_top_p": args.reasoning_top_p,
+            "answer_prefill_after_reasoning": args.answer_prefill_after_reasoning,
+            "reasoning_answer_prefix": args.reasoning_answer_prefix,
+            "seed": args.seed,
+        },
+        "test": evaluate_sanity_train(
+            model, tokenizer, tags, code_by_index, centroid_token_ids,
+            test_examples, base_cache, device, dtype, label_token_ids, args, "test",
+        ),
+    }
+    if args.eval_train or args.eval_teach:
+        results["train_sanity"] = evaluate_sanity_train(
+            model, tokenizer, tags, code_by_index, centroid_token_ids,
+            train_eval_examples, base_cache, device, dtype, label_token_ids, args, "train_sanity",
         )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(results, indent=2))
+    print(f"Saved per-example class scores and metrics to {args.output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
